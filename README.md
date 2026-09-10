@@ -35,6 +35,9 @@ local:
 - **ChatGPT/Codex passthrough.** If `~/.codex/auth.json` has a valid Codex
   access token, the shim can route Codex's native `/v1/responses` traffic to
   ChatGPT's Codex backend under the `gpt-5.5` slug used by current Codex builds.
+  The same slugs also work in reverse on `/v1/chat/completions` and
+  `/v1/messages`, so other clients (or a Codex profile with chat wire API) can
+  treat subscription Codex models as a local BYOK provider.
 - **Cursor/Composer passthrough.** If `cursor-agent login` is active, the shim
   exposes `composer-2-5` and routes through your Cursor subscription — no
   Dashboard API key (`crsr_…`) required. See

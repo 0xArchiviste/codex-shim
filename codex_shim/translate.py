@@ -170,18 +170,99 @@ def responses_to_anthropic(body: dict[str, Any], upstream_model: str, max_tokens
 
 
 def chat_to_responses_request(body: dict[str, Any], upstream_model: str, max_tokens: int | None = None) -> dict[str, Any]:
-    converted = {
+    """Convert an OpenAI chat-completions request into a Responses request.
+
+    Used when clients talk chat (or Anthropic-via-chat) to the shim and the
+    upstream is ChatGPT/Codex Responses passthrough — the reverse of
+    ``responses_to_chat``.
+    """
+    system_parts: list[str] = []
+    input_items: list[dict[str, Any]] = []
+
+    for msg in body.get("messages") or []:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "user")
+        if role in {"system", "developer"}:
+            text = _content_to_text(msg.get("content", ""))
+            if text:
+                system_parts.append(text)
+            continue
+        if role == "tool":
+            input_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": msg.get("tool_call_id") or "call_0",
+                    "output": _content_to_text(msg.get("content", "")),
+                }
+            )
+            continue
+        if role == "assistant":
+            reasoning = msg.get("reasoning_content") or msg.get("reasoning")
+            if reasoning:
+                input_items.append(
+                    {
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": str(reasoning)}],
+                    }
+                )
+            content = msg.get("content")
+            if content not in (None, ""):
+                input_items.append(
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": _chat_content_to_responses_content(content, as_output=True),
+                    }
+                )
+            for call in msg.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                fn = call.get("function") or {}
+                call_id = call.get("id") or "call_0"
+                input_items.append(
+                    {
+                        "type": "function_call",
+                        "id": call_id,
+                        "call_id": call_id,
+                        "name": fn.get("name") or "",
+                        "arguments": fn.get("arguments") or "",
+                    }
+                )
+            continue
+        input_items.append(
+            {
+                "type": "message",
+                "role": "user" if role == "user" else role,
+                "content": _chat_content_to_responses_content(msg.get("content", ""), as_output=False),
+            }
+        )
+
+    converted: dict[str, Any] = {
         "model": upstream_model,
-        "input": body.get("messages", []),
+        "input": input_items
+        or [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": ""}]}],
         "stream": bool(body.get("stream", False)),
     }
-    for src, dst in [("temperature", "temperature"), ("top_p", "top_p"), ("max_tokens", "max_output_tokens")]:
-        if src in body:
-            converted[dst] = body[src]
+    if system_parts:
+        converted["instructions"] = "\n\n".join(system_parts)
+    _copy_if_present(body, converted, "temperature")
+    _copy_if_present(body, converted, "top_p")
+    _copy_if_present(body, converted, "max_tokens", "max_output_tokens")
     if max_tokens and "max_output_tokens" not in converted:
         converted["max_output_tokens"] = max_tokens
-    if "tools" in body:
-        converted["tools"] = body["tools"]
+    _copy_if_present(body, converted, "parallel_tool_calls")
+
+    tools = _chat_tools_to_responses_tools(body.get("tools"))
+    if tools:
+        converted["tools"] = tools
+        tool_choice = _chat_tool_choice_to_responses(body.get("tool_choice"))
+        if tool_choice is not None:
+            converted["tool_choice"] = tool_choice
+
+    effort = body.get("reasoning_effort")
+    if effort:
+        converted["reasoning"] = {"effort": effort}
     return converted
 
 
@@ -375,6 +456,73 @@ def anthropic_to_response(payload: dict[str, Any], requested_model: str, tool_ty
     response = chat_completion_to_response(anthropic_to_chat_response(payload, requested_model), requested_model, tool_types)
     response["usage"] = normalize_responses_usage(payload.get("usage"))
     return response
+
+
+def response_to_chat_completion(payload: dict[str, Any], requested_model: str) -> dict[str, Any]:
+    """Convert a completed Responses object into an OpenAI chat.completion."""
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    reasoning_parts: list[str] = []
+
+    for item in payload.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "message":
+            for part in item.get("content") or []:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") in {"output_text", "text"} and part.get("text"):
+                    text_parts.append(str(part["text"]))
+        elif item_type in {"function_call", "custom_tool_call", "web_search_call"}:
+            call_id = item.get("call_id") or item.get("id") or f"call_{len(tool_calls)}"
+            tool_calls.append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name") or "",
+                        "arguments": item.get("arguments") or "",
+                    },
+                }
+            )
+        elif item_type == "reasoning":
+            for summary in item.get("summary") or []:
+                if isinstance(summary, dict) and summary.get("text"):
+                    reasoning_parts.append(str(summary["text"]))
+        elif item_type in {"output_text", "text"} and item.get("text"):
+            text_parts.append(str(item["text"]))
+
+    content = strip_think("".join(text_parts))
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": content if content else (None if tool_calls else ""),
+    }
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    if reasoning_parts:
+        message["reasoning_content"] = "\n".join(reasoning_parts)
+
+    finish_reason = "tool_calls" if tool_calls else "stop"
+    if payload.get("status") == "incomplete":
+        finish_reason = "length"
+
+    result: dict[str, Any] = {
+        "id": payload.get("id") or "chatcmpl_resp",
+        "object": "chat.completion",
+        "created": int(payload.get("created_at") or payload.get("created") or 0),
+        "model": requested_model,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+    }
+    usage = _responses_usage_to_chat_usage(normalize_responses_usage(payload.get("usage")))
+    if usage is not None:
+        result["usage"] = usage
+    return result
+
+
+def response_to_anthropic_message(payload: dict[str, Any], requested_model: str) -> dict[str, Any]:
+    """Convert a completed Responses object into an Anthropic Messages response."""
+    return chat_completion_to_anthropic_message(response_to_chat_completion(payload, requested_model), requested_model)
 
 
 def normalize_responses_usage(usage: Any) -> dict[str, Any] | None:
@@ -583,6 +731,10 @@ def _chat_image_part(part: dict[str, Any]) -> dict[str, Any] | None:
         return None
     image_url: dict[str, Any] = {"url": url}
     detail = part.get("detail") or part.get("image_detail")
+    if detail is None:
+        nested = part.get("image_url")
+        if isinstance(nested, dict):
+            detail = nested.get("detail")
     if detail and detail not in ("low", "auto", "high", "xhigh"):
         # Codex Desktop sends "original" which is not a standard OpenAI Chat
         # Completions value — providers like Kimi K2.6 reject it (400).
@@ -819,6 +971,104 @@ def _responses_tools_to_chat_tools(tools: Any) -> list[dict[str, Any]]:
         if function_tool:
             converted.append(function_tool)
     return converted
+
+
+def _chat_content_to_responses_content(content: Any, *, as_output: bool) -> list[dict[str, Any]]:
+    text_type = "output_text" if as_output else "input_text"
+    image_type = "input_image"
+    parts: list[dict[str, Any]] = []
+    for part in _chat_parts_from_content(content):
+        if part.get("type") == "text":
+            text = str(part.get("text", ""))
+            if text:
+                parts.append({"type": text_type, "text": text})
+        elif part.get("type") == "image_url":
+            url = _image_url_from_part(part)
+            if not url:
+                continue
+            image: dict[str, Any] = {"type": image_type, "image_url": url}
+            detail = None
+            image_url = part.get("image_url")
+            if isinstance(image_url, dict):
+                detail = image_url.get("detail")
+            if detail:
+                image["detail"] = detail
+            parts.append(image)
+    return parts or [{"type": text_type, "text": ""}]
+
+
+def _chat_tools_to_responses_tools(tools: Any) -> list[dict[str, Any]]:
+    if not isinstance(tools, list):
+        return []
+    converted: list[dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+            fn = tool["function"]
+            name = fn.get("name")
+            if not name:
+                continue
+            converted.append(
+                {
+                    "type": "function",
+                    "name": str(name),
+                    "description": fn.get("description") or "",
+                    "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+                }
+            )
+            continue
+        # Already Responses-shaped, or anthropic-ish with top-level name.
+        name = tool.get("name")
+        if name:
+            entry = {
+                "type": tool.get("type") or "function",
+                "name": str(name),
+                "description": tool.get("description") or "",
+                "parameters": tool.get("parameters")
+                or tool.get("input_schema")
+                or {"type": "object", "properties": {}},
+            }
+            converted.append(entry)
+    return converted
+
+
+def _chat_tool_choice_to_responses(tool_choice: Any) -> Any:
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, str):
+        return tool_choice
+    if isinstance(tool_choice, dict):
+        if tool_choice.get("type") == "function":
+            fn = tool_choice.get("function") or {}
+            name = fn.get("name") or tool_choice.get("name")
+            if name:
+                return {"type": "function", "name": str(name)}
+        if tool_choice.get("name"):
+            return {"type": "function", "name": str(tool_choice["name"])}
+    return tool_choice
+
+
+def _responses_usage_to_chat_usage(usage: dict[str, Any] | None) -> dict[str, Any] | None:
+    if usage is None:
+        return None
+    result: dict[str, Any] = {
+        "prompt_tokens": int(usage.get("input_tokens") or 0),
+        "completion_tokens": int(usage.get("output_tokens") or 0),
+        "total_tokens": int(usage.get("total_tokens") or 0),
+    }
+    input_details = usage.get("input_tokens_details")
+    if isinstance(input_details, dict):
+        prompt_details: dict[str, Any] = {}
+        cached = input_details.get("cached_tokens", input_details.get("cache_read_input_tokens"))
+        if isinstance(cached, int) and not isinstance(cached, bool):
+            prompt_details["cached_tokens"] = cached
+        if prompt_details:
+            result["prompt_tokens_details"] = prompt_details
+    output_details = usage.get("output_tokens_details")
+    if isinstance(output_details, dict) and output_details:
+        result["completion_tokens_details"] = dict(output_details)
+    return result
 
 
 def _responses_tool_to_chat_function(tool: Any) -> dict[str, Any] | None:

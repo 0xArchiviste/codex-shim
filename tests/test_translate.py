@@ -5,6 +5,10 @@ from codex_shim.translate import (
     anthropic_to_response,
     chat_completion_to_anthropic_message,
     chat_completion_to_response,
+    chat_to_anthropic,
+    chat_to_responses_request,
+    response_to_anthropic_message,
+    response_to_chat_completion,
     responses_to_anthropic,
     responses_to_chat,
 )
@@ -474,3 +478,201 @@ def test_anthropic_to_response_normalizes_cache_usage():
             "cache_creation_input_tokens": 2,
         },
     }
+
+
+def test_chat_to_responses_request_converts_messages_tools_and_images():
+    body = {
+        "model": "slug",
+        "messages": [
+            {"role": "system", "content": "Be brief"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Look"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA", "detail": "high"}},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{\"q\":1}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "found"},
+            {"role": "assistant", "content": "ok", "reasoning_content": "think"},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Lookup",
+                    "parameters": {"type": "object", "properties": {"q": {"type": "number"}}},
+                },
+            }
+        ],
+        "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+        "max_tokens": 99,
+        "stream": True,
+        "reasoning_effort": "high",
+        "temperature": 0.2,
+    }
+
+    out = chat_to_responses_request(body, "gpt-5.5")
+
+    assert out["model"] == "gpt-5.5"
+    assert out["stream"] is True
+    assert out["max_output_tokens"] == 99
+    assert out["temperature"] == 0.2
+    assert out["instructions"] == "Be brief"
+    assert out["reasoning"] == {"effort": "high"}
+    assert out["tool_choice"] == {"type": "function", "name": "lookup"}
+    assert out["tools"] == [
+        {
+            "type": "function",
+            "name": "lookup",
+            "description": "Lookup",
+            "parameters": {"type": "object", "properties": {"q": {"type": "number"}}},
+        }
+    ]
+    assert out["input"][0] == {
+        "type": "message",
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "Look"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAA", "detail": "high"},
+        ],
+    }
+    assert out["input"][1]["type"] == "function_call"
+    assert out["input"][1]["call_id"] == "call_1"
+    assert out["input"][1]["name"] == "lookup"
+    assert out["input"][2] == {"type": "function_call_output", "call_id": "call_1", "output": "found"}
+    assert out["input"][3] == {
+        "type": "reasoning",
+        "summary": [{"type": "summary_text", "text": "think"}],
+    }
+    assert out["input"][4] == {
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "ok"}],
+    }
+
+
+def test_response_to_chat_completion_preserves_tools_reasoning_and_usage():
+    payload = {
+        "id": "resp_1",
+        "created_at": 123,
+        "status": "completed",
+        "output": [
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "plan"}],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hello"}],
+            },
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "lookup",
+                "arguments": "{\"q\":1}",
+            },
+        ],
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 4,
+            "total_tokens": 14,
+            "input_tokens_details": {"cached_tokens": 3},
+        },
+    }
+
+    out = response_to_chat_completion(payload, "gpt-5.5")
+
+    assert out["id"] == "resp_1"
+    assert out["model"] == "gpt-5.5"
+    assert out["choices"][0]["finish_reason"] == "tool_calls"
+    assert out["choices"][0]["message"] == {
+        "role": "assistant",
+        "content": "hello",
+        "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{\"q\":1}"}}
+        ],
+        "reasoning_content": "plan",
+    }
+    assert out["usage"] == {
+        "prompt_tokens": 10,
+        "completion_tokens": 4,
+        "total_tokens": 14,
+        "prompt_tokens_details": {"cached_tokens": 3},
+    }
+
+
+def test_response_to_anthropic_message_maps_tools():
+    payload = {
+        "id": "resp_1",
+        "output": [
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "hi"}],
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "lookup",
+                "arguments": "{\"q\":1}",
+            },
+        ],
+        "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+    }
+
+    out = response_to_anthropic_message(payload, "gpt-5.5")
+
+    assert out["model"] == "gpt-5.5"
+    assert out["stop_reason"] == "tool_use"
+    assert out["content"] == [
+        {"type": "text", "text": "hi"},
+        {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {"q": 1}},
+    ]
+
+
+def test_chat_to_anthropic_still_works_via_responses_bridge():
+    body = {
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{\"q\":1}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "lookup", "description": "Lookup", "parameters": {"type": "object"}},
+            }
+        ],
+        "max_tokens": 50,
+    }
+
+    out = chat_to_anthropic(body, "claude-real", 50)
+
+    assert out["model"] == "claude-real"
+    assert out["system"] == "sys"
+    assert out["max_tokens"] == 50
+    assert out["tools"] == [
+        {"name": "lookup", "description": "Lookup", "input_schema": {"type": "object"}},
+    ]
+    assert out["messages"][0]["role"] == "user"
+    assert out["messages"][0]["content"] == "hi"
+    assert out["messages"][1]["role"] == "assistant"
+    assert out["messages"][1]["content"][0]["type"] == "tool_use"
+    assert out["messages"][2]["role"] == "user"
+    assert out["messages"][2]["content"][0]["type"] == "tool_result"

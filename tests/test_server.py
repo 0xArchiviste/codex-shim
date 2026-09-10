@@ -127,12 +127,27 @@ def test_image_generation_detection_is_conservative():
 async def test_image_generation_routes_to_chatgpt_passthrough_and_rewrites_model(monkeypatch, tmp_path, auth_present):
     captured = {}
 
+    class FakeStream:
+        def __init__(self, chunks):
+            self._chunks = chunks
+
+        async def iter_chunked(self, _size):
+            for chunk in self._chunks:
+                yield chunk
+
     class FakeUpstream:
         status = 200
-        content_type = "application/json"
-
-        async def json(self, content_type=None):
-            return {"id": "resp_img", "model": "gpt-5.5", "output": [{"type": "image_generation_call", "model": "gpt-5.5"}]}
+        content = FakeStream(
+            [
+                (
+                    b'data: {"type":"response.completed","response":{'
+                    b'"id":"resp_img","model":"gpt-5.5","status":"completed",'
+                    b'"output":[{"type":"image_generation_call","model":"gpt-5.5"}]'
+                    b"}}\n\n"
+                ),
+                b"data: [DONE]\n\n",
+            ]
+        )
 
         def release(self):
             pass
@@ -175,6 +190,8 @@ async def test_image_generation_routes_to_chatgpt_passthrough_and_rewrites_model
     assert payload["model"] == "real-openai"
     assert payload["output"][0]["model"] == "real-openai"
     assert captured["body"]["model"] == "gpt-5.5"
+    assert captured["body"]["store"] is False
+    assert captured["body"]["stream"] is True
     assert captured["headers"]["Authorization"] == "Bearer stub"
 
     await shim_client.close()
@@ -1213,8 +1230,9 @@ async def test_api_models_includes_chatgpt_when_auth_present(
         resp = await shim_client.get("/api/models")
         data = await resp.json()
         slugs = [m["slug"] for m in data]
-        assert slugs[0] == "gpt-5.5"
-        assert data[0]["active"] is True
+        assert "gpt-5.5" in slugs
+        active = next(m for m in data if m["slug"] == "gpt-5.5")
+        assert active["active"] is True
     finally:
         await shim_client.close()
 
@@ -1338,3 +1356,221 @@ async def test_switch_model_requires_slug(tmp_path, auth_missing):
         assert resp.status == 400
     finally:
         await shim_client.close()
+
+
+async def test_chat_completions_chatgpt_passthrough_as_byok(monkeypatch, tmp_path, auth_present):
+    captured = {}
+
+    class FakeStream:
+        def __init__(self, chunks):
+            self._chunks = chunks
+
+        async def iter_chunked(self, _size):
+            for chunk in self._chunks:
+                yield chunk
+
+    class FakeUpstream:
+        status = 200
+        content = FakeStream(
+            [
+                (
+                    b'data: {"type":"response.completed","response":{'
+                    b'"id":"resp_1","model":"gpt-5.5","status":"completed","created_at":1,'
+                    b'"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"from codex"}]}],'
+                    b'"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}'
+                    b"}}\n\n"
+                ),
+                b"data: [DONE]\n\n",
+            ]
+        )
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        captured["url"] = url
+        captured["body"] = json
+        return FakeUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"customModels": []}))
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        slug = sorted(FALLBACK_CHATGPT_PASSTHROUGH_SLUGS)[0]
+        resp = await shim_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": slug,
+                "messages": [
+                    {"role": "system", "content": "Be brief"},
+                    {"role": "user", "content": "hi"},
+                ],
+                "stream": False,
+            },
+        )
+        assert resp.status == 200
+        payload = await resp.json()
+        assert payload["object"] == "chat.completion"
+        assert payload["model"] == slug
+        assert payload["choices"][0]["message"]["content"] == "from codex"
+        assert captured["url"] == "https://chatgpt.com/backend-api/codex/responses"
+        assert captured["body"]["store"] is False
+        assert captured["body"]["stream"] is True
+        assert captured["body"]["instructions"] == "Be brief"
+        assert captured["body"]["input"][0]["role"] == "user"
+        assert captured["body"]["input"][0]["content"][0]["type"] == "input_text"
+    finally:
+        await shim_client.close()
+
+
+async def test_anthropic_messages_chatgpt_passthrough_as_byok(monkeypatch, tmp_path, auth_present):
+    class FakeStream:
+        def __init__(self, chunks):
+            self._chunks = chunks
+
+        async def iter_chunked(self, _size):
+            for chunk in self._chunks:
+                yield chunk
+
+    class FakeUpstream:
+        status = 200
+        content = FakeStream(
+            [
+                (
+                    b'data: {"type":"response.completed","response":{'
+                    b'"id":"resp_1","model":"gpt-5.5","status":"completed",'
+                    b'"output":[{"type":"message","content":[{"type":"output_text","text":"bonjour"}]},'
+                    b'{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\\"q\\":1}"}],'
+                    b'"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}'
+                    b"}}\n\n"
+                ),
+                b"data: [DONE]\n\n",
+            ]
+        )
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        return FakeUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"customModels": []}))
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        slug = sorted(FALLBACK_CHATGPT_PASSTHROUGH_SLUGS)[0]
+        resp = await shim_client.post(
+            "/v1/messages",
+            json={
+                "model": slug,
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "lookup", "description": "Lookup", "input_schema": {"type": "object"}}],
+            },
+        )
+        assert resp.status == 200
+        payload = await resp.json()
+        assert payload["type"] == "message"
+        assert payload["model"] == slug
+        assert payload["stop_reason"] == "tool_use"
+        assert payload["content"][0] == {"type": "text", "text": "bonjour"}
+        assert payload["content"][1]["type"] == "tool_use"
+        assert payload["content"][1]["name"] == "lookup"
+    finally:
+        await shim_client.close()
+
+
+async def test_chat_completions_streams_chatgpt_passthrough_as_chat_chunks(monkeypatch, tmp_path, auth_present):
+    class FakeStream:
+        def __init__(self, chunks):
+            self._chunks = chunks
+
+        async def iter_chunked(self, _size):
+            for chunk in self._chunks:
+                yield chunk
+
+    class FakeUpstream:
+        status = 200
+        content = FakeStream(
+            [
+                b'data: {"type":"response.output_text.delta","delta":"hel"}\n\n',
+                b'data: {"type":"response.output_text.delta","delta":"lo"}\n\n',
+                b'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}\n\n',
+                b"data: [DONE]\n\n",
+            ]
+        )
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        return FakeUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"customModels": []}))
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        slug = sorted(FALLBACK_CHATGPT_PASSTHROUGH_SLUGS)[0]
+        resp = await shim_client.post(
+            "/v1/chat/completions",
+            json={"model": slug, "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        )
+        assert resp.status == 200
+        body = await resp.text()
+        assert '"object": "chat.completion.chunk"' in body or '"object":"chat.completion.chunk"' in body
+        assert '"content": "hel"' in body or '"content":"hel"' in body
+        assert '"content": "lo"' in body or '"content":"lo"' in body
+        assert "data: [DONE]" in body
+    finally:
+        await shim_client.close()
+
+
+def test_responses_to_chat_stream_state_emits_tool_chunks():
+    from codex_shim.server import ResponsesToChatStreamState
+
+    state = ResponsesToChatStreamState("gpt-5.5")
+    chunks = state.handle_event(
+        {
+            "type": "response.output_item.added",
+            "item": {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "lookup",
+                "arguments": "",
+            },
+        }
+    )
+    chunks.extend(
+        state.handle_event(
+            {
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "delta": "{\"q\":1}",
+            }
+        )
+    )
+    chunks.extend(
+        state.handle_event(
+            {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                },
+            }
+        )
+    )
+    chunks.extend(state.finish())
+
+    assert chunks[0]["choices"][0]["delta"]["tool_calls"][0]["id"] == "call_1"
+    assert chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "lookup"
+    assert chunks[1]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] == "{\"q\":1}"
+    assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    assert chunks[-1]["usage"]["prompt_tokens"] == 1

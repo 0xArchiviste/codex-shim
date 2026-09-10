@@ -50,11 +50,15 @@ from .translate import (
     chat_completion_to_anthropic_message,
     chat_completion_to_response,
     chat_to_anthropic,
+    chat_to_responses_request,
     normalize_responses_usage,
+    response_to_anthropic_message,
+    response_to_chat_completion,
     responses_to_anthropic,
     responses_to_chat,
     _chat_finish_to_anthropic_stop,
     _responses_usage_to_anthropic_usage,
+    _responses_usage_to_chat_usage,
 )
 
 DEBUG_DIR = Path(__file__).resolve().parents[1] / ".codex-shim"
@@ -213,6 +217,26 @@ class ShimServer:
     async def chat_completions(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
         body = await self._maybe_apply_auto_router(body)
+        model = str(body.get("model") or "")
+        if is_chatgpt_passthrough_slug(model):
+            upstream = chatgpt_upstream_model(model)
+            forwarded = chat_to_responses_request(body, upstream)
+            return await self._chatgpt_passthrough(
+                request,
+                forwarded,
+                response_model_override=model,
+                upstream_model=upstream,
+                as_chat=True,
+            )
+        if is_cursor_passthrough_slug(model):
+            forwarded = chat_to_responses_request(body, cursor_upstream_model(model))
+            return await self._cursor_passthrough(
+                request,
+                forwarded,
+                response_model_override=model,
+                upstream_model=cursor_upstream_model(model),
+                as_chat=True,
+            )
         route = self._route(body)
         if route.is_openai_chat:
             forwarded = dict(body)
@@ -227,6 +251,30 @@ class ShimServer:
 
     async def anthropic_messages(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
+        body = await self._maybe_apply_auto_router(body)
+        model = str(body.get("model") or "")
+        if is_chatgpt_passthrough_slug(model):
+            upstream = chatgpt_upstream_model(model)
+            chat_body = anthropic_messages_to_chat(body, upstream, body.get("max_tokens"))
+            forwarded = chat_to_responses_request(chat_body, upstream, body.get("max_tokens"))
+            return await self._chatgpt_passthrough(
+                request,
+                forwarded,
+                response_model_override=model,
+                upstream_model=upstream,
+                as_anthropic=True,
+            )
+        if is_cursor_passthrough_slug(model):
+            upstream = cursor_upstream_model(model)
+            chat_body = anthropic_messages_to_chat(body, upstream, body.get("max_tokens"))
+            forwarded = chat_to_responses_request(chat_body, upstream, body.get("max_tokens"))
+            return await self._cursor_passthrough(
+                request,
+                forwarded,
+                response_model_override=model,
+                upstream_model=upstream,
+                as_anthropic=True,
+            )
         route = self._route(body)
         if route.is_openai_chat:
             forwarded = anthropic_messages_to_chat(body, route.model, route.max_output_tokens)
@@ -468,11 +516,15 @@ class ShimServer:
         body: dict[str, Any],
         response_model_override: str | None = None,
         upstream_model: str | None = None,
+        as_chat: bool = False,
+        as_anthropic: bool = False,
     ) -> web.StreamResponse:
         """Forward a Responses request to chatgpt.com using the user's Codex auth.
 
         Lets the picker expose OpenAI GPT models (ChatGPT subscription) as
-        first-class models alongside configured BYOK entries.
+        first-class models alongside configured BYOK entries. When ``as_chat``
+        or ``as_anthropic`` is set, translates the Responses reply back into
+        that client wire format so Codex models can be used as a BYOK provider.
         """
         auth_path = DEFAULT_CODEX_AUTH.expanduser()
         try:
@@ -486,10 +538,15 @@ class ShimServer:
             raise web.HTTPUnauthorized(text="auth.json has no access_token")
         forwarded = _sanitize_chatgpt_passthrough_body(body)
         forwarded["model"] = upstream_model or CHATGPT_MODEL_SLUG
+        # ChatGPT's Codex backend rejects store=true / non-stream Responses.
+        forwarded["store"] = False
+        client_wants_stream = bool(forwarded.get("stream"))
+        forwarded["stream"] = True
+        client_model = response_model_override or forwarded["model"]
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
-            "Accept": "text/event-stream" if forwarded.get("stream") else "application/json",
+            "Accept": "text/event-stream",
             "OpenAI-Beta": "responses=2026-02-06",
             "originator": "codex_cli_rs",
             "chatgpt-account-id": account_id,
@@ -500,10 +557,18 @@ class ShimServer:
             upstream = await session.post(url, json=forwarded, headers=headers)
             if upstream.status >= 400:
                 return await _error_response(upstream)
-            if not forwarded.get("stream"):
-                payload = await upstream.json(content_type=None)
+            if not client_wants_stream:
+                payload = await _collect_completed_response(upstream)
                 _rewrite_response_model(payload, response_model_override)
+                if as_anthropic:
+                    return web.json_response(response_to_anthropic_message(payload, client_model))
+                if as_chat:
+                    return web.json_response(response_to_chat_completion(payload, client_model))
                 return web.json_response(payload)
+            if as_anthropic:
+                return await self._stream_responses_as_anthropic(request, upstream, client_model)
+            if as_chat:
+                return await self._stream_responses_as_chat(request, upstream, client_model)
             response = _sse_response()
             await response.prepare(request)
             try:
@@ -577,6 +642,8 @@ class ShimServer:
         response_model_override: str | None = None,
         upstream_model: str | None = None,
         force_non_stream: bool = False,
+        as_chat: bool = False,
+        as_anthropic: bool = False,
     ) -> web.StreamResponse:
         """Route Composer through cursor-agent using Cursor subscription login."""
         if not cursor_passthrough_available():
@@ -616,7 +683,78 @@ class ShimServer:
             normalized_usage = normalize_responses_usage(usage)
             if normalized_usage:
                 payload["usage"] = normalized_usage
+            if as_anthropic:
+                return web.json_response(response_to_anthropic_message(payload, slug))
+            if as_chat:
+                return web.json_response(response_to_chat_completion(payload, slug))
             return web.json_response(payload)
+
+        if as_anthropic:
+            response = _sse_response()
+            await response.prepare(request)
+            anthropic_state = AnthropicMessagesStreamState(slug)
+            try:
+                await anthropic_state.start(response)
+                async for event in iter_cursor_agent_events(prompt, upstream):
+                    if event["type"] == "text_delta":
+                        await anthropic_state.write_chat_delta(
+                            response,
+                            {"choices": [{"delta": {"content": event["delta"]}}]},
+                        )
+                    elif event["type"] == "usage":
+                        normalized_usage = normalize_responses_usage(event.get("usage"))
+                        if normalized_usage:
+                            anthropic_state.usage = normalized_usage
+                    elif event["type"] == "error":
+                        message = str(event.get("message") or "cursor-agent failed")
+                        await anthropic_state.write_chat_delta(
+                            response,
+                            {"choices": [{"delta": {"content": message}}]},
+                        )
+                        break
+                await anthropic_state.finish(response)
+            except ClientDisconnected:
+                pass
+            except Exception as exc:
+                print(f"[err] cursor passthrough {slug}: {exc}", flush=True)
+                raise web.HTTPBadGateway(text=str(exc)) from exc
+            try:
+                await response.write_eof()
+            except Exception:
+                pass
+            return response
+
+        if as_chat:
+            response = _sse_response()
+            await response.prepare(request)
+            chat_state = ResponsesToChatStreamState(slug)
+            try:
+                async for event in iter_cursor_agent_events(prompt, upstream):
+                    if event["type"] == "text_delta":
+                        for chunk in chat_state.text_delta(str(event["delta"])):
+                            await _write_sse(response, chunk)
+                    elif event["type"] == "usage":
+                        normalized_usage = normalize_responses_usage(event.get("usage"))
+                        if normalized_usage:
+                            chat_state.usage = normalized_usage
+                    elif event["type"] == "error":
+                        message = str(event.get("message") or "cursor-agent failed")
+                        for chunk in chat_state.text_delta(message):
+                            await _write_sse(response, chunk)
+                        break
+                for chunk in chat_state.finish():
+                    await _write_sse(response, chunk)
+                await _safe_write(response, b"data: [DONE]\n\n")
+            except ClientDisconnected:
+                pass
+            except Exception as exc:
+                print(f"[err] cursor passthrough {slug}: {exc}", flush=True)
+                raise web.HTTPBadGateway(text=str(exc)) from exc
+            try:
+                await response.write_eof()
+            except Exception:
+                pass
+            return response
 
         response = _sse_response()
         await response.prepare(request)
@@ -943,13 +1081,96 @@ class ShimServer:
             pass
         return response
 
+    async def _stream_responses_as_chat(
+        self, request: web.Request, upstream, model: str
+    ) -> web.StreamResponse:
+        response = _sse_response()
+        await response.prepare(request)
+        state = ResponsesToChatStreamState(model)
+        try:
+            async for line in _sse_lines(upstream):
+                if line == "[DONE]":
+                    break
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                for chunk in state.handle_event(event):
+                    await _write_sse(response, chunk)
+            for chunk in state.finish():
+                await _write_sse(response, chunk)
+            await _safe_write(response, b"data: [DONE]\n\n")
+        except ClientDisconnected:
+            pass
+        finally:
+            upstream.release()
+        try:
+            await response.write_eof()
+        except Exception:
+            pass
+        return response
+
+    async def _stream_responses_as_anthropic(
+        self, request: web.Request, upstream, model: str
+    ) -> web.StreamResponse:
+        response = _sse_response()
+        await response.prepare(request)
+        chat_state = ResponsesToChatStreamState(model)
+        anthropic_state = AnthropicMessagesStreamState(model)
+        try:
+            await anthropic_state.start(response)
+            async for line in _sse_lines(upstream):
+                if line == "[DONE]":
+                    break
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                for chunk in chat_state.handle_event(event):
+                    await anthropic_state.write_chat_delta(response, chunk)
+            for chunk in chat_state.finish():
+                await anthropic_state.write_chat_delta(response, chunk)
+            await anthropic_state.finish(response)
+        except ClientDisconnected:
+            pass
+        finally:
+            upstream.release()
+        try:
+            await response.write_eof()
+        except Exception:
+            pass
+        return response
+
 
 _DROP_ITEM = object()
 
 
+_CHATGPT_UNSUPPORTED_REQUEST_KEYS = frozenset(
+    {
+        "temperature",
+        "top_p",
+        "max_output_tokens",
+        "max_tokens",
+        "presence_penalty",
+        "frequency_penalty",
+        "logit_bias",
+        "n",
+        "user",
+        "seed",
+    }
+)
+
+
 def _sanitize_chatgpt_passthrough_body(body: dict[str, Any]) -> dict[str, Any]:
     sanitized = _sanitize_chatgpt_passthrough_value(body)
-    return sanitized if isinstance(sanitized, dict) else {}
+    if not isinstance(sanitized, dict):
+        return {}
+    # ChatGPT Codex backend currently requires store=false and rejects several
+    # OpenAI Responses sampling knobs that chat/BYOK clients often send.
+    sanitized["store"] = False
+    for key in _CHATGPT_UNSUPPORTED_REQUEST_KEYS:
+        sanitized.pop(key, None)
+    return sanitized
 
 
 def _sanitize_chatgpt_passthrough_value(value: Any) -> Any:
@@ -990,6 +1211,131 @@ def _rewrite_response_model(payload: Any, model: str | None) -> None:
     elif isinstance(payload, list):
         for item in payload:
             _rewrite_response_model(item, model)
+
+
+class ResponsesToChatStreamState:
+    """Translate Responses SSE events into OpenAI chat.completion.chunk payloads.
+
+    Enables ChatGPT/Codex Responses upstreams to be consumed by clients that
+    speak chat completions (reverse of ``ResponsesStreamState``).
+    """
+
+    def __init__(self, model: str):
+        self.model = model
+        self.chunk_id = f"chatcmpl_{int(time.time() * 1000)}"
+        self.created = int(time.time())
+        self.tool_index_by_item: dict[str, int] = {}
+        self.next_tool_index = 0
+        self.usage: dict[str, Any] | None = None
+        self.finish_reason: str | None = None
+        self._finished = False
+        self._role_sent = False
+
+    def text_delta(self, text: str) -> list[dict[str, Any]]:
+        if not text:
+            return []
+        delta: dict[str, Any] = {"content": text}
+        if not self._role_sent:
+            delta["role"] = "assistant"
+            self._role_sent = True
+        return [self._chunk(delta)]
+
+    def handle_event(self, event: dict[str, Any]) -> list[dict[str, Any]]:
+        event_type = event.get("type")
+        if event_type == "response.output_text.delta":
+            return self.text_delta(str(event.get("delta") or ""))
+        if event_type == "response.reasoning_summary_text.delta":
+            text = str(event.get("delta") or "")
+            if not text:
+                return []
+            delta: dict[str, Any] = {"reasoning_content": text}
+            if not self._role_sent:
+                delta["role"] = "assistant"
+                self._role_sent = True
+            return [self._chunk(delta)]
+        if event_type == "response.output_item.added":
+            item = event.get("item") or {}
+            item_type = item.get("type")
+            if item_type in {"function_call", "custom_tool_call", "web_search_call"}:
+                item_id = str(item.get("id") or item.get("call_id") or f"call_{self.next_tool_index}")
+                index = self.tool_index_by_item.setdefault(item_id, self.next_tool_index)
+                if index == self.next_tool_index:
+                    self.next_tool_index += 1
+                call_id = item.get("call_id") or item.get("id") or item_id
+                name = item.get("name") or ""
+                args = item.get("arguments") or ""
+                tool_delta: dict[str, Any] = {
+                    "index": index,
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": args},
+                }
+                delta = {"tool_calls": [tool_delta]}
+                if not self._role_sent:
+                    delta["role"] = "assistant"
+                    self._role_sent = True
+                self.finish_reason = "tool_calls"
+                return [self._chunk(delta)]
+            return []
+        if event_type == "response.function_call_arguments.delta":
+            item_id = str(event.get("item_id") or "")
+            index = self.tool_index_by_item.get(item_id)
+            if index is None:
+                index = self.next_tool_index
+                self.tool_index_by_item[item_id] = index
+                self.next_tool_index += 1
+            arg_delta = str(event.get("delta") or "")
+            if not arg_delta:
+                return []
+            self.finish_reason = "tool_calls"
+            return [
+                self._chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": index,
+                                "function": {"arguments": arg_delta},
+                            }
+                        ]
+                    }
+                )
+            ]
+        if event_type == "response.completed":
+            response = event.get("response") or {}
+            usage = normalize_responses_usage(response.get("usage"))
+            if usage is not None:
+                self.usage = usage
+            status = response.get("status")
+            if status == "incomplete":
+                self.finish_reason = "length"
+            elif self.finish_reason is None:
+                self.finish_reason = "stop"
+            return []
+        if event_type == "response.incomplete":
+            self.finish_reason = "length"
+            return []
+        return []
+
+    def finish(self) -> list[dict[str, Any]]:
+        if self._finished:
+            return []
+        self._finished = True
+        reason = self.finish_reason or "stop"
+        chunk = self._chunk({}, finish_reason=reason)
+        if self.usage is not None:
+            chat_usage = _responses_usage_to_chat_usage(self.usage)
+            if chat_usage is not None:
+                chunk["usage"] = chat_usage
+        return [chunk]
+
+    def _chunk(self, delta: dict[str, Any], finish_reason: str | None = None) -> dict[str, Any]:
+        return {
+            "id": self.chunk_id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
 
 
 class AnthropicMessagesStreamState:
@@ -2075,6 +2421,43 @@ async def _sse_lines(upstream) -> Any:
     tail = buffer.decode("utf-8", errors="replace").strip()
     if tail.startswith("data:"):
         yield tail[5:].strip()
+
+
+async def _collect_completed_response(upstream) -> dict[str, Any]:
+    """Consume a Responses SSE stream and return the final response object.
+
+    ChatGPT's Codex backend requires stream=true; non-stream clients still get a
+    normal JSON body by aggregating the stream. ``response.completed`` often
+    arrives with an empty ``output`` array, so we rebuild output from
+    ``response.output_item.done`` events.
+    """
+    completed: dict[str, Any] | None = None
+    output_items: list[dict[str, Any]] = []
+    try:
+        async for line in _sse_lines(upstream):
+            if line == "[DONE]":
+                break
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            event_type = event.get("type")
+            if event_type == "response.output_item.done" and isinstance(event.get("item"), dict):
+                output_items.append(event["item"])
+            elif event_type == "response.completed" and isinstance(event.get("response"), dict):
+                completed = event["response"]
+            elif event.get("object") == "response" and event.get("status") == "completed":
+                completed = event
+    finally:
+        upstream.release()
+    if completed is None:
+        raise web.HTTPBadGateway(text="ChatGPT Responses stream ended without response.completed")
+    if output_items and not completed.get("output"):
+        completed = dict(completed)
+        completed["output"] = output_items
+    return completed
 
 
 def _anthropic_stream_to_chat_chunk(event: dict[str, Any], model: str) -> dict[str, Any]:

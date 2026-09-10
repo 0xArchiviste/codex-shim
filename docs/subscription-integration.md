@@ -219,3 +219,26 @@ so a stale shell variable cannot override your CLI OAuth login.
 Use subscription passthrough when you want to spend subscription quota through
 the local authenticated CLI. Use BYOK models when you want to route to a provider
 endpoint and API key you control directly.
+
+---
+
+## Reverse BYOK: Codex models as a provider
+
+When ChatGPT/Codex (or Cursor) passthrough is available, the same slugs also
+work on the shim's OpenAI chat and Anthropic Messages surfaces:
+
+```text
+POST http://127.0.0.1:8765/v1/chat/completions   # OpenAI chat clients
+POST http://127.0.0.1:8765/v1/messages            # Anthropic Messages clients
+```
+
+Point another Codex profile (or any chat/Messages client) at the shim with a
+dummy API key and select `gpt-5.5` / `composer-2-5`. The shim translates:
+
+```text
+chat / Messages  →  Responses  →  ChatGPT Codex or cursor-agent
+                 ←  chat / Messages reply
+```
+
+Tools, images, reasoning, and streaming are preserved on the reverse path the
+same way the forward BYOK path preserves them for Codex Desktop.
