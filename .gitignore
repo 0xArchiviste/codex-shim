@@ -3,6 +3,21 @@
 *.log
 *.pid
 
+# Local secrets / BYOK helpers (never commit)
+api-key
+**/api-key
+*.env
+.env.*
+CURSOR-BYOK.txt
+reverse-byok.env
+reverse-byok.codex.toml
+auth.json
+**/auth.json
+ngrok.yml
+**/ngrok.yml
+cursor-api-key
+**/cursor-api-key
+
 # Local Codex inspection artifacts (don't ship)
 codedb.snapshot
 *.asar
