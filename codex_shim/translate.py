@@ -495,7 +495,11 @@ def anthropic_to_response(payload: dict[str, Any], requested_model: str, tool_ty
     return response
 
 
-def response_to_chat_completion(payload: dict[str, Any], requested_model: str) -> dict[str, Any]:
+def response_to_chat_completion(
+    payload: dict[str, Any],
+    requested_model: str,
+    tool_name_aliases: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """Convert a completed Responses object into an OpenAI chat.completion."""
     text_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
@@ -513,13 +517,14 @@ def response_to_chat_completion(payload: dict[str, Any], requested_model: str) -
                     text_parts.append(str(part["text"]))
         elif item_type in {"function_call", "custom_tool_call", "web_search_call"}:
             call_id = item.get("call_id") or item.get("id") or f"call_{len(tool_calls)}"
+            name, arguments = remap_chatgpt_tool_call(item, tool_name_aliases)
             tool_calls.append(
                 {
                     "id": call_id,
                     "type": "function",
                     "function": {
-                        "name": item.get("name") or "",
-                        "arguments": item.get("arguments") or "",
+                        "name": name,
+                        "arguments": arguments,
                     },
                 }
             )
@@ -1034,6 +1039,145 @@ def _chat_content_to_responses_content(content: Any, *, as_output: bool) -> list
     return parts or [{"type": text_type, "text": ""}]
 
 
+CHATGPT_SAFE_APPLY_PATCH_NAME = "cs_ApplyPatch"
+
+_CHATGPT_UNSUPPORTED_NATIVE_TOOL_TYPES = frozenset(
+    {
+        "apply_patch",
+        "local_shell",
+        "computer_use",
+        "computer_use_preview",
+    }
+)
+
+
+def _tool_name(tool: dict[str, Any]) -> str:
+    fn = tool.get("function")
+    if isinstance(fn, dict) and fn.get("name"):
+        return str(fn["name"])
+    if tool.get("name"):
+        return str(tool["name"])
+    return str(tool.get("type") or "")
+
+
+def is_apply_patch_tool_name(name: Any) -> bool:
+    compact = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+    return compact in {"applypatch"}
+
+
+def chatgpt_tool_name_aliases(tools: Any) -> dict[str, str]:
+    """Map ChatGPT-safe tool names back to the client-facing names."""
+    aliases: dict[str, str] = {}
+    if not isinstance(tools, list):
+        return aliases
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = _tool_name(tool)
+        tool_type = str(tool.get("type") or "").strip().lower()
+        if is_apply_patch_tool_name(name) or tool_type == "apply_patch":
+            aliases[CHATGPT_SAFE_APPLY_PATCH_NAME] = name or "ApplyPatch"
+    return aliases
+
+
+def _function_tool_entry(name: str, tool: dict[str, Any], fn: dict[str, Any] | None = None) -> dict[str, Any]:
+    src = fn if isinstance(fn, dict) else tool
+    entry: dict[str, Any] = {
+        "type": "function",
+        "name": str(name),
+        "description": src.get("description") or tool.get("description") or "",
+    }
+    params = src.get("parameters") or tool.get("parameters") or tool.get("input_schema")
+    if params:
+        entry["parameters"] = params
+    if isinstance(src.get("strict"), bool):
+        entry["strict"] = src["strict"]
+    elif isinstance(tool.get("strict"), bool):
+        entry["strict"] = tool["strict"]
+    return entry
+
+
+def sanitize_chatgpt_tools(tools: Any) -> list[dict[str, Any]]:
+    """Normalize tools for ChatGPT's Codex Responses backend.
+
+    That backend rejects native ``apply_patch`` and also rejects ``parameters``
+    on a tool it has already classified as apply_patch by name. Keep Cursor's
+    ApplyPatch as a plain function tool under a non-colliding name.
+    """
+    if not isinstance(tools, list):
+        return []
+    converted: list[dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = _tool_name(tool)
+        tool_type = str(tool.get("type") or "function").strip().lower()
+        fn = tool["function"] if isinstance(tool.get("function"), dict) else None
+        if is_apply_patch_tool_name(name) or tool_type == "apply_patch":
+            source = dict(tool)
+            if not source.get("description"):
+                source["description"] = (fn or {}).get("description") or "Apply a unified diff patch."
+            if not source.get("parameters") and not source.get("input_schema") and not (fn or {}).get("parameters"):
+                source["parameters"] = {
+                    "type": "object",
+                    "properties": {"input": {"type": "string"}},
+                }
+            converted.append(_function_tool_entry(CHATGPT_SAFE_APPLY_PATCH_NAME, source, fn))
+            continue
+        if tool_type in _CHATGPT_UNSUPPORTED_NATIVE_TOOL_TYPES:
+            fname = name or tool_type
+            if not fname:
+                continue
+            converted.append(_function_tool_entry(fname, tool, fn))
+            continue
+        fname = (fn or {}).get("name") if fn else name
+        if not fname:
+            continue
+        if tool_type in {"function", "custom"} or fn is not None or tool.get("parameters") or tool.get("input_schema"):
+            converted.append(_function_tool_entry(str(fname), tool, fn))
+            continue
+        # Preserve Responses-native tools that ChatGPT actually accepts (e.g. web_search).
+        converted.append({"type": tool_type})
+    return converted
+
+
+def remap_chatgpt_tool_call(item: dict[str, Any], aliases: dict[str, str] | None = None) -> tuple[str, str]:
+    """Return (client_tool_name, chat_arguments) for a Responses tool call item."""
+    aliases = aliases or {}
+    name = str(item.get("name") or "")
+    name = aliases.get(name, name)
+    args = item.get("arguments")
+    if args in (None, ""):
+        args = item.get("input") or ""
+    if isinstance(args, dict):
+        return name, json.dumps(args)
+    text = str(args or "")
+    if name and is_apply_patch_tool_name(name) and text.strip() and not text.lstrip().startswith("{"):
+        return aliases.get(CHATGPT_SAFE_APPLY_PATCH_NAME, name), json.dumps({"input": text})
+    return name, text
+
+
+def summarize_chatgpt_tools(tools: Any) -> list[dict[str, Any]]:
+    """Compact tool metadata for debug logs (no argument payloads)."""
+    summary: list[dict[str, Any]] = []
+    if not isinstance(tools, list):
+        return summary
+    for index, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            summary.append({"index": index, "invalid": True})
+            continue
+        summary.append(
+            {
+                "index": index,
+                "type": tool.get("type"),
+                "name": tool.get("name") or _tool_name(tool),
+                "keys": sorted(str(key) for key in tool.keys()),
+                "has_parameters": "parameters" in tool,
+            }
+        )
+    return summary
+
+
 def _chat_tools_to_responses_tools(tools: Any) -> list[dict[str, Any]]:
     if not isinstance(tools, list):
         return []
@@ -1046,27 +1190,11 @@ def _chat_tools_to_responses_tools(tools: Any) -> list[dict[str, Any]]:
             name = fn.get("name")
             if not name:
                 continue
-            converted.append(
-                {
-                    "type": "function",
-                    "name": str(name),
-                    "description": fn.get("description") or "",
-                    "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
-                }
-            )
+            converted.append(_function_tool_entry(str(name), tool, fn))
             continue
-        # Already Responses-shaped, or anthropic-ish with top-level name.
         name = tool.get("name")
         if name:
-            entry = {
-                "type": tool.get("type") or "function",
-                "name": str(name),
-                "description": tool.get("description") or "",
-                "parameters": tool.get("parameters")
-                or tool.get("input_schema")
-                or {"type": "object", "properties": {}},
-            }
-            converted.append(entry)
+            converted.append(_function_tool_entry(str(name), tool, None))
     return converted
 
 

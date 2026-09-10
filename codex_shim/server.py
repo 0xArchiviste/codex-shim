@@ -55,11 +55,15 @@ from .translate import (
     chat_completion_to_response,
     chat_to_anthropic,
     chat_to_responses_request,
+    chatgpt_tool_name_aliases,
     clamp_responses_id,
     normalize_responses_usage,
+    remap_chatgpt_tool_call,
     response_to_anthropic_message,
     response_to_chat_completion,
     responses_function_call_ids,
+    sanitize_chatgpt_tools,
+    summarize_chatgpt_tools,
     responses_to_anthropic,
     responses_to_chat,
     _chat_finish_to_anthropic_stop,
@@ -70,6 +74,40 @@ from .translate import (
 DEBUG_DIR = Path(__file__).resolve().parents[1] / ".codex-shim"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 PICKER_TOKEN_HEADER = "X-Codex-Shim-Picker-Token"
+
+
+def chatgpt_debug_enabled() -> bool:
+    return os.environ.get("CODEX_SHIM_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _log_chatgpt_forward(body: dict[str, Any]) -> None:
+    summary = summarize_chatgpt_tools(body.get("tools"))
+    print(f"[chatgpt] forward tools={json.dumps(summary, default=str)}", flush=True)
+    if not chatgpt_debug_enabled():
+        return
+    try:
+        dump_path = DEBUG_DIR / "last_chatgpt_forward.json"
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+        dump_path.write_text(
+            json.dumps(
+                {
+                    "model": body.get("model"),
+                    "store": body.get("store"),
+                    "stream": body.get("stream"),
+                    "tool_count": len(body.get("tools") or []),
+                    "tools": body.get("tools") or [],
+                    "input_types": [
+                        item.get("type")
+                        for item in (body.get("input") or [])
+                        if isinstance(item, dict)
+                    ],
+                },
+                indent=2,
+                default=str,
+            )
+        )
+    except OSError as exc:
+        print(f"[chatgpt] debug dump failed: {exc}", flush=True)
 
 
 def _request_api_key(request: web.Request) -> str:
@@ -592,12 +630,14 @@ class ShimServer:
         account_id = tokens.get("account_id") or ""
         if not access_token:
             raise web.HTTPUnauthorized(text="auth.json has no access_token")
+        tool_aliases = chatgpt_tool_name_aliases(body.get("tools"))
         forwarded = _sanitize_chatgpt_passthrough_body(body)
         forwarded["model"] = upstream_model or CHATGPT_MODEL_SLUG
         # ChatGPT's Codex backend rejects store=true / non-stream Responses.
         forwarded["store"] = False
         client_wants_stream = bool(forwarded.get("stream"))
         forwarded["stream"] = True
+        _log_chatgpt_forward(forwarded)
         client_model = response_model_override or forwarded["model"]
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -612,19 +652,19 @@ class ShimServer:
         async with ClientSession(timeout=self.timeout) as session:
             upstream = await session.post(url, json=forwarded, headers=headers)
             if upstream.status >= 400:
-                return await _error_response(upstream)
+                return await _error_response(upstream, slug="chatgpt")
             if not client_wants_stream:
                 payload = await _collect_completed_response(upstream)
                 _rewrite_response_model(payload, response_model_override)
                 if as_anthropic:
                     return web.json_response(response_to_anthropic_message(payload, client_model))
                 if as_chat:
-                    return web.json_response(response_to_chat_completion(payload, client_model))
+                    return web.json_response(response_to_chat_completion(payload, client_model, tool_aliases))
                 return web.json_response(payload)
             if as_anthropic:
                 return await self._stream_responses_as_anthropic(request, upstream, client_model)
             if as_chat:
-                return await self._stream_responses_as_chat(request, upstream, client_model)
+                return await self._stream_responses_as_chat(request, upstream, client_model, tool_aliases)
             response = _sse_response()
             await response.prepare(request)
             try:
@@ -1138,11 +1178,15 @@ class ShimServer:
         return response
 
     async def _stream_responses_as_chat(
-        self, request: web.Request, upstream, model: str
+        self,
+        request: web.Request,
+        upstream,
+        model: str,
+        tool_name_aliases: dict[str, str] | None = None,
     ) -> web.StreamResponse:
         response = _sse_response()
         await response.prepare(request)
-        state = ResponsesToChatStreamState(model)
+        state = ResponsesToChatStreamState(model, tool_name_aliases)
         try:
             async for line in _sse_lines(upstream):
                 if line == "[DONE]":
@@ -1260,6 +1304,8 @@ def _sanitize_chatgpt_passthrough_body(body: dict[str, Any]) -> dict[str, Any]:
                 item["id"] = clamp_responses_id(item["id"])
             if isinstance(item.get("call_id"), str):
                 item["call_id"] = clamp_responses_id(item["call_id"], prefix="call")
+    if isinstance(sanitized.get("tools"), list):
+        sanitized["tools"] = sanitize_chatgpt_tools(sanitized["tools"])
     return sanitized
 
 
@@ -1310,8 +1356,9 @@ class ResponsesToChatStreamState:
     speak chat completions (reverse of ``ResponsesStreamState``).
     """
 
-    def __init__(self, model: str):
+    def __init__(self, model: str, tool_name_aliases: dict[str, str] | None = None):
         self.model = model
+        self.tool_name_aliases = tool_name_aliases or {}
         self.chunk_id = f"chatcmpl_{int(time.time() * 1000)}"
         self.created = int(time.time())
         self.tool_index_by_item: dict[str, int] = {}
@@ -1352,8 +1399,7 @@ class ResponsesToChatStreamState:
                 if index == self.next_tool_index:
                     self.next_tool_index += 1
                 call_id = item.get("call_id") or item.get("id") or item_id
-                name = item.get("name") or ""
-                args = item.get("arguments") or ""
+                name, args = remap_chatgpt_tool_call(item, self.tool_name_aliases)
                 tool_delta: dict[str, Any] = {
                     "index": index,
                     "id": call_id,
@@ -1367,7 +1413,10 @@ class ResponsesToChatStreamState:
                 self.finish_reason = "tool_calls"
                 return [self._chunk(delta)]
             return []
-        if event_type == "response.function_call_arguments.delta":
+        if event_type in {
+            "response.function_call_arguments.delta",
+            "response.custom_tool_call_input.delta",
+        }:
             item_id = str(event.get("item_id") or "")
             index = self.tool_index_by_item.get(item_id)
             if index is None:
@@ -2635,11 +2684,17 @@ def _compact_response_payload(model: str, summary: str, usage: Any = None) -> di
 
 async def _error_response(upstream, *, slug: str | None = None) -> web.Response:
     text = await upstream.text()
-    if slug:
-        print(
-            f"[err] upstream {slug} returned {upstream.status}: {text[:500]}",
-            flush=True,
-        )
+    print(
+        f"[err] upstream {slug or 'provider'} returned {upstream.status}: {text[:800]}",
+        flush=True,
+    )
+    if chatgpt_debug_enabled():
+        try:
+            (DEBUG_DIR / "last_chatgpt_error.json").write_text(
+                json.dumps({"status": upstream.status, "body": text[:8000]}, indent=2)
+            )
+        except OSError:
+            pass
     return web.Response(status=upstream.status, text=text, content_type=upstream.content_type or "text/plain")
 
 

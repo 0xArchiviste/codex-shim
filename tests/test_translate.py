@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from codex_shim.translate import (
     RESPONSES_ID_MAX_LEN,
     anthropic_messages_to_chat,
@@ -559,6 +561,86 @@ def test_chat_to_responses_request_converts_messages_tools_and_images():
         "role": "assistant",
         "content": [{"type": "output_text", "text": "ok"}],
     }
+
+
+def test_chat_to_responses_request_keeps_apply_patch_as_function():
+    body = {
+        "messages": [{"role": "user", "content": "edit"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "ApplyPatch",
+                    "description": "Apply a unified diff",
+                    "parameters": {"type": "object", "properties": {"input": {"type": "string"}}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "ReadFile",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                },
+            },
+        ],
+    }
+    out = chat_to_responses_request(body, "gpt-5.5")
+    assert out["tools"][0]["type"] == "function"
+    assert out["tools"][0]["name"] == "ApplyPatch"
+    assert "parameters" in out["tools"][0]
+    assert out["tools"][1]["name"] == "ReadFile"
+
+
+def test_sanitize_chatgpt_tools_renames_apply_patch():
+    from codex_shim.translate import CHATGPT_SAFE_APPLY_PATCH_NAME, sanitize_chatgpt_tools
+
+    tools = sanitize_chatgpt_tools(
+        [
+            {
+                "type": "function",
+                "name": "ApplyPatch",
+                "description": "Apply a unified diff",
+                "parameters": {"type": "object", "properties": {"input": {"type": "string"}}},
+            },
+            {"type": "apply_patch"},
+            {
+                "type": "function",
+                "name": "ReadFile",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+            },
+        ]
+    )
+    assert tools[0]["type"] == "function"
+    assert tools[0]["name"] == CHATGPT_SAFE_APPLY_PATCH_NAME
+    assert tools[0]["parameters"]["properties"]["input"]["type"] == "string"
+    assert tools[1]["name"] == CHATGPT_SAFE_APPLY_PATCH_NAME
+    assert tools[1]["type"] == "function"
+    assert "apply_patch" not in {tool.get("type") for tool in tools}
+    assert tools[2]["name"] == "ReadFile"
+
+
+def test_response_to_chat_completion_remaps_apply_patch_name():
+    from codex_shim.translate import CHATGPT_SAFE_APPLY_PATCH_NAME
+
+    payload = {
+        "id": "resp_1",
+        "created_at": 1,
+        "status": "completed",
+        "output": [
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": CHATGPT_SAFE_APPLY_PATCH_NAME,
+                "arguments": '{"input":"*** Begin Patch\\n*** Update File: a.py\\n"}',
+            }
+        ],
+    }
+    out = response_to_chat_completion(payload, "gpt-5.6-sol", {CHATGPT_SAFE_APPLY_PATCH_NAME: "ApplyPatch"})
+    call = out["choices"][0]["message"]["tool_calls"][0]
+    assert call["function"]["name"] == "ApplyPatch"
+    assert json.loads(call["function"]["arguments"])["input"].startswith("*** Begin Patch")
 
 
 def test_chat_to_responses_request_clamps_long_tool_ids():

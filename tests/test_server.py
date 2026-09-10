@@ -70,6 +70,30 @@ def test_sanitize_chatgpt_passthrough_body_drops_shim_reasoning():
     assert len(body["input"]) == 3
 
 
+def test_sanitize_chatgpt_passthrough_body_renames_apply_patch():
+    from codex_shim.translate import CHATGPT_SAFE_APPLY_PATCH_NAME
+
+    body = {
+        "model": "gpt-5.6-sol",
+        "tools": [
+            {"type": "function", "name": "Shell", "parameters": {"type": "object"}},
+            {
+                "type": "function",
+                "function": {
+                    "name": "ApplyPatch",
+                    "description": "patch",
+                    "parameters": {"type": "object", "properties": {"input": {"type": "string"}}},
+                },
+            },
+        ],
+    }
+    sanitized = _sanitize_chatgpt_passthrough_body(body)
+    assert sanitized["tools"][0]["name"] == "Shell"
+    assert sanitized["tools"][1]["type"] == "function"
+    assert sanitized["tools"][1]["name"] == CHATGPT_SAFE_APPLY_PATCH_NAME
+    assert "parameters" in sanitized["tools"][1]
+
+
 def test_sanitize_chatgpt_passthrough_body_clamps_long_input_ids():
     long_id = "call-" + ("y" * 70)
     body = {
@@ -1442,6 +1466,115 @@ async def test_chat_completions_chatgpt_passthrough_as_byok(monkeypatch, tmp_pat
         assert captured["body"]["instructions"] == "Be brief"
         assert captured["body"]["input"][0]["role"] == "user"
         assert captured["body"]["input"][0]["content"][0]["type"] == "input_text"
+    finally:
+        await shim_client.close()
+
+
+def _cursor_agent_tools():
+    names = [
+        "Shell",
+        "Glob",
+        "rg",
+        "AwaitShell",
+        "ReadFile",
+        "Delete",
+        "ApplyPatch",
+        "EditNotebook",
+        "Write",
+        "Grep",
+        "Task",
+        "WebSearch",
+        "Browser",
+        "TodoWrite",
+        "ReadLints",
+        "StrReplace",
+        "AskQuestion",
+        "CallMcpTool",
+    ]
+    tools = []
+    for name in names:
+        parameters = {"type": "object", "properties": {"input": {"type": "string"}}}
+        if name == "ApplyPatch":
+            parameters = {"type": "object", "properties": {"input": {"type": "string"}}, "required": ["input"]}
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": f"{name} tool",
+                    "parameters": parameters,
+                },
+            }
+        )
+    return tools
+
+
+async def test_chat_completions_chatgpt_passthrough_sanitizes_cursor_tools(monkeypatch, tmp_path, auth_present):
+    from codex_shim.translate import CHATGPT_SAFE_APPLY_PATCH_NAME
+
+    captured = {}
+
+    class FakeStream:
+        def __init__(self, chunks):
+            self._chunks = chunks
+
+        async def iter_chunked(self, _size):
+            for chunk in self._chunks:
+                yield chunk
+
+    class FakeUpstream:
+        status = 200
+        content = FakeStream(
+            [
+                (
+                    b'data: {"type":"response.completed","response":{'
+                    b'"id":"resp_1","model":"gpt-5.5","status":"completed","created_at":1,'
+                    b'"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],'
+                    b'"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}'
+                    b"}}\n\n"
+                ),
+                b"data: [DONE]\n\n",
+            ]
+        )
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        captured["body"] = json
+        return FakeUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"customModels": []}))
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        slug = sorted(FALLBACK_CHATGPT_PASSTHROUGH_SLUGS)[0]
+        resp = await shim_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": slug,
+                "messages": [{"role": "user", "content": "edit the file"}],
+                "stream": False,
+                "tools": _cursor_agent_tools(),
+            },
+        )
+        assert resp.status == 200
+        tools = captured["body"]["tools"]
+        assert len(tools) == 18
+        assert all(tool.get("type") != "apply_patch" for tool in tools)
+        apply_tools = [tool for tool in tools if "apply" in str(tool.get("name", "")).lower()]
+        assert apply_tools == [
+            {
+                "type": "function",
+                "name": CHATGPT_SAFE_APPLY_PATCH_NAME,
+                "description": "ApplyPatch tool",
+                "parameters": {"type": "object", "properties": {"input": {"type": "string"}}, "required": ["input"]},
+            }
+        ]
+        assert tools[0]["name"] == "Shell"
+        assert "parameters" in tools[0]
     finally:
         await shim_client.close()
 
