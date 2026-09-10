@@ -17,8 +17,12 @@ from codex_shim.server import (
     _sanitize_chatgpt_passthrough_body,
     _set_active_model,
 )
-from codex_shim.settings import FALLBACK_CHATGPT_PASSTHROUGH_SLUGS
-from codex_shim.translate import SHIM_ENCRYPTED_CONTENT_PREFIX
+from codex_shim.settings import CHATGPT_MODEL_ALIASES, FALLBACK_CHATGPT_PASSTHROUGH_SLUGS
+from codex_shim.translate import SHIM_ENCRYPTED_CONTENT_PREFIX, clamp_responses_id
+
+
+def _expected_chatgpt_slugs() -> list[str]:
+    return sorted(set(FALLBACK_CHATGPT_PASSTHROUGH_SLUGS) | set(CHATGPT_MODEL_ALIASES))
 
 
 @pytest.fixture
@@ -65,6 +69,23 @@ def test_sanitize_chatgpt_passthrough_body_drops_shim_reasoning():
     assert sanitized["input"][1]["encrypted_content"] == "openai-verifiable-content"
     assert len(body["input"]) == 3
 
+
+def test_sanitize_chatgpt_passthrough_body_clamps_long_input_ids():
+    long_id = "call-" + ("y" * 70)
+    body = {
+        "model": "gpt-5.5",
+        "input": [
+            {"type": "message", "id": long_id, "role": "user", "content": "hi"},
+            {"type": "function_call", "id": long_id, "call_id": long_id, "name": "lookup", "arguments": "{}"},
+        ],
+    }
+    sanitized = _sanitize_chatgpt_passthrough_body(body)
+    assert len(sanitized["input"][0]["id"]) <= 64
+    call = sanitized["input"][1]
+    assert call["id"].startswith("fc")
+    assert len(call["id"]) <= 64
+    assert len(call["call_id"]) <= 64
+    assert call["call_id"] == clamp_responses_id(long_id, prefix="call")
 
 def test_sanitize_chatgpt_passthrough_body_removes_nested_shim_encrypted_content():
     body = {
@@ -515,13 +536,13 @@ async def test_health_and_models_include_chatgpt_passthrough_when_auth_present(t
     health = await shim_client.get("/health")
     assert health.status == 200
     body = await health.json()
-    assert body["models"] == len(FALLBACK_CHATGPT_PASSTHROUGH_SLUGS)
+    assert body["models"] == len(_expected_chatgpt_slugs())
     assert body["chatgpt_passthrough"] is True
 
     models = await shim_client.get("/v1/models")
     assert models.status == 200
     payload = await models.json()
-    assert sorted(model["id"] for model in payload["data"]) == sorted(FALLBACK_CHATGPT_PASSTHROUGH_SLUGS)
+    assert sorted(model["id"] for model in payload["data"]) == _expected_chatgpt_slugs()
 
     await shim_client.close()
 
@@ -1574,3 +1595,26 @@ def test_responses_to_chat_stream_state_emits_tool_chunks():
     assert chunks[1]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] == "{\"q\":1}"
     assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
     assert chunks[-1]["usage"]["prompt_tokens"] == 1
+
+
+async def test_v1_requires_configured_api_key(monkeypatch, tmp_path, auth_missing):
+    key = "csk_test_secret_key_value_32chars!!"
+    monkeypatch.setenv("CODEX_SHIM_API_KEY", key)
+    monkeypatch.setattr("codex_shim.server.load_shim_api_key", lambda path=None: key)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"customModels": []}))
+    shim_client = TestClient(TestServer(ShimServer(settings).app()))
+    await shim_client.start_server()
+    try:
+        denied = await shim_client.get("/v1/models")
+        assert denied.status == 401
+        allowed = await shim_client.get(
+            "/v1/models",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        assert allowed.status == 200
+        health = await shim_client.get("/health")
+        assert health.status == 200
+        assert (await health.json())["auth_required"] is True
+    finally:
+        await shim_client.close()

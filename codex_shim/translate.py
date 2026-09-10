@@ -1,8 +1,45 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any
+
+RESPONSES_ID_MAX_LEN = 64
+
+
+def clamp_responses_id(value: Any, *, prefix: str = "id", require_prefix: bool = False) -> str:
+    """Clamp Responses item ids to 64 chars, optionally enforcing a required prefix.
+
+    ChatGPT's Codex backend rejects ids longer than 64 chars, and function_call
+    item ``id`` values must begin with ``fc``.
+    """
+    text = str(value or "").strip() or prefix
+    if require_prefix and not text.startswith(prefix):
+        text = f"{prefix}_{text}"
+    if len(text) <= RESPONSES_ID_MAX_LEN:
+        return text
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:20]
+    if require_prefix:
+        prefix_part = f"{prefix}_"
+        budget = RESPONSES_ID_MAX_LEN - len(digest) - 1 - len(prefix_part)
+        if budget < 1:
+            return f"{prefix}_{digest}"[:RESPONSES_ID_MAX_LEN]
+        remainder = text[len(prefix) :].lstrip("_-") if text.startswith(prefix) else text
+        mid = re.sub(r"[^A-Za-z0-9_-]+", "", remainder)[:budget] or "x"
+        return f"{prefix_part}{mid}_{digest}"[:RESPONSES_ID_MAX_LEN]
+    keep = RESPONSES_ID_MAX_LEN - len(digest) - 1
+    head = re.sub(r"[^A-Za-z0-9_-]+", "", text[:keep]) or prefix
+    return f"{head[:keep]}_{digest}"[:RESPONSES_ID_MAX_LEN]
+
+
+def responses_function_call_ids(raw_id: Any) -> tuple[str, str]:
+    """Map a chat/Cursor tool-call id to Responses ``(id, call_id)``."""
+    source = str(raw_id or "").strip() or "0"
+    return (
+        clamp_responses_id(source, prefix="fc", require_prefix=True),
+        clamp_responses_id(source, prefix="call"),
+    )
 
 
 THINK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
@@ -192,7 +229,7 @@ def chat_to_responses_request(body: dict[str, Any], upstream_model: str, max_tok
             input_items.append(
                 {
                     "type": "function_call_output",
-                    "call_id": msg.get("tool_call_id") or "call_0",
+                    "call_id": clamp_responses_id(msg.get("tool_call_id") or "call_0", prefix="call"),
                     "output": _content_to_text(msg.get("content", "")),
                 }
             )
@@ -219,11 +256,11 @@ def chat_to_responses_request(body: dict[str, Any], upstream_model: str, max_tok
                 if not isinstance(call, dict):
                     continue
                 fn = call.get("function") or {}
-                call_id = call.get("id") or "call_0"
+                item_id, call_id = responses_function_call_ids(call.get("id") or "call_0")
                 input_items.append(
                     {
                         "type": "function_call",
-                        "id": call_id,
+                        "id": item_id,
                         "call_id": call_id,
                         "name": fn.get("name") or "",
                         "arguments": fn.get("arguments") or "",

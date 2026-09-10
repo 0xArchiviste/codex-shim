@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from codex_shim.translate import (
+    RESPONSES_ID_MAX_LEN,
     anthropic_messages_to_chat,
     anthropic_to_response,
     chat_completion_to_anthropic_message,
     chat_completion_to_response,
     chat_to_anthropic,
     chat_to_responses_request,
+    clamp_responses_id,
     response_to_anthropic_message,
     response_to_chat_completion,
     responses_to_anthropic,
@@ -558,6 +560,54 @@ def test_chat_to_responses_request_converts_messages_tools_and_images():
         "content": [{"type": "output_text", "text": "ok"}],
     }
 
+
+def test_chat_to_responses_request_clamps_long_tool_ids():
+    long_id = "call_" + ("x" * 80)
+    assert len(long_id) > RESPONSES_ID_MAX_LEN
+    body = {
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": long_id, "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": long_id, "content": "ok"},
+        ]
+    }
+    out = chat_to_responses_request(body, "gpt-5.5")
+    call = next(item for item in out["input"] if item["type"] == "function_call")
+    result = next(item for item in out["input"] if item["type"] == "function_call_output")
+    assert call["id"].startswith("fc")
+    assert len(call["id"]) <= RESPONSES_ID_MAX_LEN
+    assert len(call["call_id"]) <= RESPONSES_ID_MAX_LEN
+    assert call["call_id"] == result["call_id"]
+    assert call["id"] != call["call_id"]
+    assert call["call_id"] == clamp_responses_id(long_id, prefix="call")
+
+
+def test_chat_to_responses_request_prefixes_cursor_style_call_ids():
+    cursor_id = "call-28ef37e4-622e-49db-958c-eae5f2fa5af6-2"
+    body = {
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": cursor_id, "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": cursor_id, "content": "ok"},
+        ]
+    }
+    out = chat_to_responses_request(body, "gpt-5.5")
+    call = next(item for item in out["input"] if item["type"] == "function_call")
+    result = next(item for item in out["input"] if item["type"] == "function_call_output")
+    assert call["id"].startswith("fc")
+    assert len(call["id"]) <= RESPONSES_ID_MAX_LEN
+    assert call["call_id"] == cursor_id
+    assert result["call_id"] == cursor_id
 
 def test_response_to_chat_completion_preserves_tools_reasoning_and_usage():
     payload = {

@@ -5,7 +5,7 @@ import json
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from codex_shim.hostguard import build_allowed_hosts, host_only
+from codex_shim.hostguard import build_allowed_hosts, host_matches, host_only
 from codex_shim.server import ShimServer
 
 
@@ -39,6 +39,14 @@ def test_build_allowed_hosts_adds_bind_host_and_env(monkeypatch):
 
 def test_build_allowed_hosts_ignores_wildcard_bind():
     assert build_allowed_hosts("0.0.0.0") == {"127.0.0.1", "localhost", "::1"}
+
+
+def test_host_matches_suffix_wildcard():
+    allowed = {"127.0.0.1", "*.trycloudflare.com"}
+    assert host_matches("foo.trycloudflare.com", allowed) is True
+    assert host_matches("trycloudflare.com", allowed) is True
+    assert host_matches("evil.com", allowed) is False
+    assert host_matches("trycloudflare.com.evil", allowed) is False
 
 
 @pytest.fixture

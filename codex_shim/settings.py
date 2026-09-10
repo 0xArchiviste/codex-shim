@@ -5,11 +5,13 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 from typing import Any
 
 
 DEFAULT_SETTINGS = Path.home() / ".codex-shim" / "models.json"
 DEFAULT_CURSOR_API_KEY_FILE = Path.home() / ".codex-shim" / "cursor-api-key"
+DEFAULT_SHIM_API_KEY_FILE = Path.home() / ".codex-shim" / "api-key"
 DEFAULT_CODEX_AUTH = Path.home() / ".codex" / "auth.json"
 DEFAULT_CODEX_MODELS_CACHE = Path.home() / ".codex" / "models_cache.json"
 DEFAULT_HOST = "127.0.0.1"
@@ -34,6 +36,45 @@ FALLBACK_CHATGPT_DISPLAY_NAMES = {
     "gpt-5.2": "gpt-5.2",
     "codex-auto-review": "Codex Auto Review",
 }
+
+# Cursor/BYOK-facing aliases → (upstream Codex slug, reasoning effort).
+# "light" maps to ChatGPT Codex effort "low".
+CHATGPT_MODEL_ALIASES: dict[str, tuple[str, str | None]] = {
+    "gpt-5.6-sol-medium": ("gpt-5.6-sol", "medium"),
+    "gpt-6-astra-light": ("gpt-6-astra", "low"),
+    "gpt-6-astra-medium": ("gpt-6-astra", "medium"),
+}
+
+
+def load_shim_api_key(path: Path | None = None) -> str:
+    """Return the inbound shim API key if one is configured.
+
+    Precedence: ``CODEX_SHIM_API_KEY``, then ``~/.codex-shim/api-key``.
+    Empty means inbound auth is disabled.
+    """
+    env = os.environ.get("CODEX_SHIM_API_KEY", "").strip()
+    if env:
+        return env
+    key_path = Path(path or DEFAULT_SHIM_API_KEY_FILE).expanduser()
+    if key_path.exists():
+        return key_path.read_text().strip()
+    return ""
+
+
+def ensure_shim_api_key(path: Path | None = None) -> str:
+    """Return a shim API key, creating ``~/.codex-shim/api-key`` when missing."""
+    existing = load_shim_api_key(path)
+    if existing:
+        return existing
+    key_path = Path(path or DEFAULT_SHIM_API_KEY_FILE).expanduser()
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    key = f"csk_{secrets.token_urlsafe(32)}"
+    key_path.write_text(key + "\n")
+    try:
+        key_path.chmod(0o600)
+    except OSError:
+        pass
+    return key
 
 
 def chatgpt_passthrough_available(auth_path: Path | None = None) -> bool:
@@ -137,29 +178,52 @@ def load_chatgpt_passthrough_catalog_models(cache_path: Path | None = None) -> l
 
 
 def chatgpt_passthrough_slugs(cache_path: Path | None = None) -> set[str]:
-    return {str(model["slug"]) for model in load_chatgpt_passthrough_catalog_models(cache_path) if model.get("slug")}
+    slugs = {str(model["slug"]) for model in load_chatgpt_passthrough_catalog_models(cache_path) if model.get("slug")}
+    slugs.update(CHATGPT_MODEL_ALIASES)
+    return slugs
 
 
 def chatgpt_passthrough_display_names(cache_path: Path | None = None) -> dict[str, str]:
-    return {
+    names = {
         str(model["slug"]): str(model.get("display_name") or model["slug"])
         for model in load_chatgpt_passthrough_catalog_models(cache_path)
         if model.get("slug")
     }
+    names.update(
+        {
+            "gpt-5.6-sol-medium": "GPT-5.6-Sol Medium",
+            "gpt-6-astra-light": "GPT-6-Astra Light",
+            "gpt-6-astra-medium": "GPT-6-Astra Medium",
+        }
+    )
+    return names
+
+
+def resolve_chatgpt_passthrough(slug: str, cache_path: Path | None = None) -> tuple[str, str | None] | None:
+    """Return (upstream_model, reasoning_effort) for a ChatGPT passthrough slug/alias."""
+    if slug in CHATGPT_MODEL_ALIASES:
+        return CHATGPT_MODEL_ALIASES[slug]
+    if slug.startswith("openai-gpt-"):
+        return CHATGPT_MODEL_SLUG, None
+    if slug in chatgpt_passthrough_slugs(cache_path):
+        return slug, None
+    return None
 
 
 def is_chatgpt_passthrough_slug(slug: str, cache_path: Path | None = None) -> bool:
-    if slug.startswith("openai-gpt-"):
-        return True
-    return slug in chatgpt_passthrough_slugs(cache_path)
+    return resolve_chatgpt_passthrough(slug, cache_path) is not None
 
 
 def chatgpt_upstream_model(slug: str, cache_path: Path | None = None) -> str:
-    if slug.startswith("openai-gpt-"):
+    resolved = resolve_chatgpt_passthrough(slug, cache_path)
+    if resolved is None:
         return CHATGPT_MODEL_SLUG
-    if slug in chatgpt_passthrough_slugs(cache_path):
-        return slug
-    return CHATGPT_MODEL_SLUG
+    return resolved[0]
+
+
+def chatgpt_passthrough_effort(slug: str, cache_path: Path | None = None) -> str | None:
+    resolved = resolve_chatgpt_passthrough(slug, cache_path)
+    return None if resolved is None else resolved[1]
 
 
 def slugify(value: str) -> str:

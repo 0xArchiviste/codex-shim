@@ -39,6 +39,7 @@ from .settings import (
     chatgpt_passthrough_display_names,
     chatgpt_passthrough_slugs,
     default_model_slug,
+    ensure_shim_api_key,
     is_chatgpt_passthrough_slug,
     usable_byok_models,
     byok_model_has_credentials,
@@ -637,6 +638,7 @@ def start(settings_path: Path, port: int) -> int:
     ]
     env = os.environ.copy()
     env["PYTHONPATH"] = str(PROJECT_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    env["CODEX_SHIM_API_KEY"] = ensure_shim_api_key()
     process = _popen_daemon(cmd, log, env)
     PID_PATH.write_text(str(process.pid))
     for _ in range(50):

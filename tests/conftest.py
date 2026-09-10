@@ -4,6 +4,16 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _isolate_shim_runtime_env(monkeypatch, tmp_path_factory):
+    """Keep local tunnel/auth env from leaking into unit tests."""
+    monkeypatch.delenv("CODEX_SHIM_API_KEY", raising=False)
+    monkeypatch.delenv("CODEX_SHIM_ALLOWED_HOSTS", raising=False)
+    key_path = tmp_path_factory.mktemp("shim-api") / "api-key"
+    monkeypatch.setattr("codex_shim.settings.DEFAULT_SHIM_API_KEY_FILE", key_path)
+    monkeypatch.setattr("codex_shim.server.load_shim_api_key", lambda path=None: "")
+
+
+@pytest.fixture(autouse=True)
 def _disable_cursor_passthrough_by_default(monkeypatch, request):
     if "cursor_present" in request.fixturenames:
         return

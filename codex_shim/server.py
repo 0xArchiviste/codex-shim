@@ -9,6 +9,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+import os
 from urllib.parse import urljoin
 
 from aiohttp import ClientSession, ClientTimeout, web
@@ -31,11 +32,14 @@ from .settings import (
     DEFAULT_HOST,
     DEFAULT_PORT,
     PROVIDER_NAME,
+    ensure_shim_api_key,
+    load_shim_api_key,
     ModelSettings,
     ShimModel,
     available_model_slugs,
     chatgpt_passthrough_available,
     chatgpt_passthrough_display_names,
+    chatgpt_passthrough_effort,
     chatgpt_passthrough_slugs,
     byok_model_has_credentials,
     chatgpt_upstream_model,
@@ -51,9 +55,11 @@ from .translate import (
     chat_completion_to_response,
     chat_to_anthropic,
     chat_to_responses_request,
+    clamp_responses_id,
     normalize_responses_usage,
     response_to_anthropic_message,
     response_to_chat_completion,
+    responses_function_call_ids,
     responses_to_anthropic,
     responses_to_chat,
     _chat_finish_to_anthropic_stop,
@@ -66,18 +72,62 @@ CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 PICKER_TOKEN_HEADER = "X-Codex-Shim-Picker-Token"
 
 
+def _request_api_key(request: web.Request) -> str:
+    auth = request.headers.get("Authorization") or ""
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return (
+        request.headers.get("x-api-key")
+        or request.headers.get("api-key")
+        or ""
+    ).strip()
+
+
+def _keys_match(provided: str, expected: str) -> bool:
+    if not provided or not expected or len(provided) != len(expected):
+        return False
+    return secrets.compare_digest(provided, expected)
+
+
+def api_key_middleware(expected_key: str):
+    """Require a bearer/x-api-key on ``/v1/*`` when a shim key is configured."""
+
+    @web.middleware
+    async def _auth(request: web.Request, handler):
+        if not expected_key or not request.path.startswith("/v1/"):
+            return await handler(request)
+        if not _keys_match(_request_api_key(request), expected_key):
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "Invalid API key",
+                        "type": "invalid_request_error",
+                        "code": "invalid_api_key",
+                    }
+                },
+                status=401,
+            )
+        return await handler(request)
+
+    return _auth
+
+
 class ShimServer:
     def __init__(self, settings_path: Path = DEFAULT_SETTINGS, host: str = DEFAULT_HOST):
         self.settings = ModelSettings(settings_path)
         self.host = host
         self.timeout = ClientTimeout(total=None, sock_connect=120, sock_read=None)
         self.picker_token = secrets.token_urlsafe(32)
+        self.api_key = load_shim_api_key()
 
     def app(self) -> web.Application:
         allowed_hosts = build_allowed_hosts(self.host)
         app = web.Application(
             client_max_size=64 * 1024 * 1024,
-            middlewares=[host_guard_middleware(allowed_hosts)],
+            middlewares=[
+                host_guard_middleware(allowed_hosts),
+                api_key_middleware(self.api_key),
+            ],
         )
         app.router.add_get("/health", self.health)
         app.router.add_get("/v1/models", self.models)
@@ -187,6 +237,7 @@ class ShimServer:
                 "chatgpt_passthrough": chatgpt_ok,
                 "cursor_passthrough": cursor_ok,
                 "auto_router": self._active_router() is not None,
+                "auth_required": bool(self.api_key),
             }
         )
 
@@ -216,11 +267,13 @@ class ShimServer:
 
     async def chat_completions(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
+        _log_incoming_request("/v1/chat/completions", body)
         body = await self._maybe_apply_auto_router(body)
         model = str(body.get("model") or "")
         if is_chatgpt_passthrough_slug(model):
             upstream = chatgpt_upstream_model(model)
             forwarded = chat_to_responses_request(body, upstream)
+            _apply_chatgpt_alias_effort(forwarded, model)
             return await self._chatgpt_passthrough(
                 request,
                 forwarded,
@@ -257,6 +310,7 @@ class ShimServer:
             upstream = chatgpt_upstream_model(model)
             chat_body = anthropic_messages_to_chat(body, upstream, body.get("max_tokens"))
             forwarded = chat_to_responses_request(chat_body, upstream, body.get("max_tokens"))
+            _apply_chatgpt_alias_effort(forwarded, model)
             return await self._chatgpt_passthrough(
                 request,
                 forwarded,
@@ -293,9 +347,11 @@ class ShimServer:
         if is_chatgpt_passthrough_slug(model):
             upstream = chatgpt_upstream_model(model)
             override = model if model != upstream else None
+            forwarded = dict(body)
+            _apply_chatgpt_alias_effort(forwarded, model)
             return await self._chatgpt_passthrough(
                 request,
-                body,
+                forwarded,
                 response_model_override=override,
                 upstream_model=upstream,
             )
@@ -1142,6 +1198,17 @@ class ShimServer:
         return response
 
 
+def _apply_chatgpt_alias_effort(body: dict[str, Any], slug: str) -> None:
+    """Inject alias reasoning effort into a Responses body when the client did not set one."""
+    effort = chatgpt_passthrough_effort(slug)
+    if not effort:
+        return
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort"):
+        return
+    body["reasoning"] = {**(reasoning if isinstance(reasoning, dict) else {}), "effort": effort}
+
+
 _DROP_ITEM = object()
 
 
@@ -1170,6 +1237,29 @@ def _sanitize_chatgpt_passthrough_body(body: dict[str, Any]) -> dict[str, Any]:
     sanitized["store"] = False
     for key in _CHATGPT_UNSUPPORTED_REQUEST_KEYS:
         sanitized.pop(key, None)
+    items = sanitized.get("input")
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "function_call":
+                if isinstance(item.get("call_id"), str):
+                    call_id = clamp_responses_id(item["call_id"], prefix="call")
+                elif isinstance(item.get("id"), str):
+                    _, call_id = responses_function_call_ids(item["id"])
+                else:
+                    call_id = "call_0"
+                if isinstance(item.get("id"), str):
+                    item_id = clamp_responses_id(item["id"], prefix="fc", require_prefix=True)
+                else:
+                    item_id, _ = responses_function_call_ids(call_id)
+                item["id"] = item_id
+                item["call_id"] = call_id
+                continue
+            if isinstance(item.get("id"), str):
+                item["id"] = clamp_responses_id(item["id"])
+            if isinstance(item.get("call_id"), str):
+                item["call_id"] = clamp_responses_id(item["call_id"], prefix="call")
     return sanitized
 
 
@@ -2850,6 +2940,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = parser.parse_args(argv)
+    os.environ.setdefault("CODEX_SHIM_API_KEY", ensure_shim_api_key())
 
     shim = ShimServer(args.settings, host=args.host)
     web.run_app(shim.app(), host=args.host, port=args.port, handle_signals=True)

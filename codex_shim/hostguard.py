@@ -52,6 +52,19 @@ def build_allowed_hosts(bind_host: str) -> set[str]:
     return allowed
 
 
+def host_matches(hostname: str, allowed_hosts: set[str]) -> bool:
+    """Exact allowlist match, plus ``*.example.com`` suffix patterns from env."""
+    host = (hostname or "").lower()
+    if host in allowed_hosts:
+        return True
+    for pattern in allowed_hosts:
+        if pattern.startswith("*.") and len(pattern) > 2:
+            suffix = pattern[1:]  # .example.com
+            if host.endswith(suffix) or host == pattern[2:]:
+                return True
+    return False
+
+
 def host_guard_middleware(allowed_hosts: set[str]):
     """aiohttp middleware that rejects requests with a non-allowlisted Host."""
     allowed = {host.lower() for host in allowed_hosts}
@@ -59,8 +72,12 @@ def host_guard_middleware(allowed_hosts: set[str]):
     @web.middleware
     async def _guard(request: web.Request, handler):
         hostname = host_only(request.headers.get("Host", "")).lower()
-        if hostname not in allowed:
-            raise web.HTTPForbidden(text="Forbidden: Host header not allowed")
+        if not host_matches(hostname, allowed):
+            print(f"[host] reject Host={hostname!r} path={request.path}", flush=True)
+            raise web.HTTPForbidden(
+                text='{"error":{"message":"Forbidden: Host header not allowed","type":"invalid_request_error"}}',
+                content_type="application/json",
+            )
         return await handler(request)
 
     return _guard
