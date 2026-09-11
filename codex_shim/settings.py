@@ -49,7 +49,21 @@ FALLBACK_CHATGPT_DISPLAY_NAMES = {
 
 # Cursor/BYOK-facing aliases → (upstream Codex slug, reasoning effort).
 # "light" maps to ChatGPT Codex effort "low".
+#
+# Prefer the opaque ``cs-*`` ids in Cursor: bare Codex slugs like
+# ``gpt-6-astra`` are intercepted by Cursor's model registry, which rejects
+# chat_completions ("no routable deployment").
 CHATGPT_MODEL_ALIASES: dict[str, tuple[str, str | None]] = {
+    # Opaque ids (recommended for Cursor BYOK)
+    "cs-astra": ("gpt-6-astra", None),
+    "cs-astra-light": ("gpt-6-astra", "low"),
+    "cs-astra-low": ("gpt-6-astra", "low"),
+    "cs-astra-medium": ("gpt-6-astra", "medium"),
+    "cs-astra-high": ("gpt-6-astra", "high"),
+    "cs-sol": ("gpt-5.6-sol", None),
+    "cs-sol-light": ("gpt-5.6-sol", "low"),
+    "cs-sol-medium": ("gpt-5.6-sol", "medium"),
+    # Legacy effort suffixes (still accepted)
     "gpt-5.6-sol-medium": ("gpt-5.6-sol", "medium"),
     "gpt-5.6-sol-light": ("gpt-5.6-sol", "low"),
     "gpt-6-astra-light": ("gpt-6-astra", "low"),
@@ -214,6 +228,14 @@ def chatgpt_passthrough_display_names(cache_path: Path | None = None) -> dict[st
     }
     names.update(
         {
+            "cs-astra": "Codex Astra",
+            "cs-astra-light": "Codex Astra Light",
+            "cs-astra-low": "Codex Astra Low",
+            "cs-astra-medium": "Codex Astra Medium",
+            "cs-astra-high": "Codex Astra High",
+            "cs-sol": "Codex Sol",
+            "cs-sol-light": "Codex Sol Light",
+            "cs-sol-medium": "Codex Sol Medium",
             "gpt-5.6-sol-medium": "GPT-5.6-Sol Medium",
             "gpt-5.6-sol-light": "GPT-5.6-Sol Light",
             "gpt-6-astra-light": "GPT-6-Astra Light",

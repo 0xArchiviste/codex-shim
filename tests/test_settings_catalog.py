@@ -661,5 +661,8 @@ def test_resolve_chatgpt_passthrough_normalizes_astra_aliases(monkeypatch, tmp_p
     assert resolve_chatgpt_passthrough("gpt-6-astra medium") == ("gpt-6-astra", "medium")
     assert resolve_chatgpt_passthrough("openai-gpt-6-astra") == ("gpt-6-astra", None)
     assert resolve_chatgpt_passthrough("openai-gpt-6-astra-medium") == ("gpt-6-astra", "medium")
+    assert resolve_chatgpt_passthrough("cs-astra-medium") == ("gpt-6-astra", "medium")
+    assert resolve_chatgpt_passthrough("cs-astra") == ("gpt-6-astra", None)
+    assert resolve_chatgpt_passthrough("cs-sol-light") == ("gpt-5.6-sol", "low")
     assert chatgpt_upstream_model("gpt-6-astra-med") == "gpt-6-astra"
     assert chatgpt_passthrough_effort("gpt-6-astra-light") == "low"
