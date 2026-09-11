@@ -26,6 +26,11 @@ FALLBACK_CHATGPT_PASSTHROUGH_SLUGS = (
     "gpt-5.3-codex-spark",
     "gpt-5.2",
     "codex-auto-review",
+    "gpt-5.6-sol",
+    "gpt-5.6-luna",
+    "gpt-5.6-terra",
+    "gpt-6-astra",
+    "gpt-reserve",
 )
 FALLBACK_CHATGPT_DISPLAY_NAMES = {
     "gpt-5.5": "GPT-5.5",
@@ -35,15 +40,33 @@ FALLBACK_CHATGPT_DISPLAY_NAMES = {
     "gpt-5.3-codex-spark": "GPT-5.3-Codex-Spark",
     "gpt-5.2": "gpt-5.2",
     "codex-auto-review": "Codex Auto Review",
+    "gpt-5.6-sol": "GPT-5.6-Sol",
+    "gpt-5.6-luna": "GPT-5.6-Luna",
+    "gpt-5.6-terra": "GPT-5.6-Terra",
+    "gpt-6-astra": "GPT-6-Astra",
+    "gpt-reserve": "GPT Reserve",
 }
 
 # Cursor/BYOK-facing aliases → (upstream Codex slug, reasoning effort).
 # "light" maps to ChatGPT Codex effort "low".
 CHATGPT_MODEL_ALIASES: dict[str, tuple[str, str | None]] = {
     "gpt-5.6-sol-medium": ("gpt-5.6-sol", "medium"),
+    "gpt-5.6-sol-light": ("gpt-5.6-sol", "low"),
     "gpt-6-astra-light": ("gpt-6-astra", "low"),
+    "gpt-6-astra-low": ("gpt-6-astra", "low"),
     "gpt-6-astra-medium": ("gpt-6-astra", "medium"),
+    "gpt-6-astra-med": ("gpt-6-astra", "medium"),
+    "gpt-6-astra-high": ("gpt-6-astra", "high"),
 }
+
+
+def _normalize_model_slug(slug: str) -> str:
+    text = str(slug or "").strip().lower().replace(" ", "-").replace("_", "-")
+    while "--" in text:
+        text = text.replace("--", "-")
+    if text.startswith("openai-"):
+        text = text[len("openai-") :]
+    return text
 
 
 def load_shim_api_key(path: Path | None = None) -> str:
@@ -192,8 +215,12 @@ def chatgpt_passthrough_display_names(cache_path: Path | None = None) -> dict[st
     names.update(
         {
             "gpt-5.6-sol-medium": "GPT-5.6-Sol Medium",
+            "gpt-5.6-sol-light": "GPT-5.6-Sol Light",
             "gpt-6-astra-light": "GPT-6-Astra Light",
+            "gpt-6-astra-low": "GPT-6-Astra Low",
             "gpt-6-astra-medium": "GPT-6-Astra Medium",
+            "gpt-6-astra-med": "GPT-6-Astra Medium",
+            "gpt-6-astra-high": "GPT-6-Astra High",
         }
     )
     return names
@@ -201,12 +228,26 @@ def chatgpt_passthrough_display_names(cache_path: Path | None = None) -> dict[st
 
 def resolve_chatgpt_passthrough(slug: str, cache_path: Path | None = None) -> tuple[str, str | None] | None:
     """Return (upstream_model, reasoning_effort) for a ChatGPT passthrough slug/alias."""
-    if slug in CHATGPT_MODEL_ALIASES:
-        return CHATGPT_MODEL_ALIASES[slug]
-    if slug.startswith("openai-gpt-"):
+    normalized = _normalize_model_slug(slug)
+    if not normalized:
+        return None
+    if normalized in CHATGPT_MODEL_ALIASES:
+        return CHATGPT_MODEL_ALIASES[normalized]
+    catalog = {
+        _normalize_model_slug(str(model["slug"])): str(model["slug"])
+        for model in load_chatgpt_passthrough_catalog_models(cache_path)
+        if model.get("slug")
+    }
+    if normalized in catalog:
+        return catalog[normalized], None
+    # When the Codex models cache is stale/missing, still accept modern GPT/Codex
+    # slugs verbatim rather than collapsing them to the legacy default model.
+    if normalized.startswith(("gpt-5.", "gpt-6-", "codex-")):
+        return normalized, None
+    # Legacy catch-all for unknown openai-gpt-* ids.
+    raw = str(slug or "").strip().lower()
+    if raw.startswith("openai-gpt-"):
         return CHATGPT_MODEL_SLUG, None
-    if slug in chatgpt_passthrough_slugs(cache_path):
-        return slug, None
     return None
 
 

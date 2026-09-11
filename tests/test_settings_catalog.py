@@ -645,3 +645,21 @@ class ModelSettingsFixture:
             )
         )
         return ModelSettings(path).load()[0]
+
+
+def test_resolve_chatgpt_passthrough_normalizes_astra_aliases(monkeypatch, tmp_path):
+    from codex_shim.settings import (
+        chatgpt_passthrough_effort,
+        chatgpt_upstream_model,
+        resolve_chatgpt_passthrough,
+    )
+
+    missing = tmp_path / "missing-models-cache.json"
+    monkeypatch.setattr("codex_shim.settings.DEFAULT_CODEX_MODELS_CACHE", missing)
+
+    assert resolve_chatgpt_passthrough("GPT-6-Astra-Medium") == ("gpt-6-astra", "medium")
+    assert resolve_chatgpt_passthrough("gpt-6-astra medium") == ("gpt-6-astra", "medium")
+    assert resolve_chatgpt_passthrough("openai-gpt-6-astra") == ("gpt-6-astra", None)
+    assert resolve_chatgpt_passthrough("openai-gpt-6-astra-medium") == ("gpt-6-astra", "medium")
+    assert chatgpt_upstream_model("gpt-6-astra-med") == "gpt-6-astra"
+    assert chatgpt_passthrough_effort("gpt-6-astra-light") == "low"
