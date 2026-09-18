@@ -23,6 +23,7 @@ from .cursor_passthrough import (
     is_cursor_passthrough_slug,
     iter_cursor_agent_events,
 )
+from . import ensemble as ensemble_module
 from . import router as router_module
 from .hostguard import build_allowed_hosts, host_guard_middleware
 from .settings import (
@@ -223,6 +224,17 @@ class ShimServer:
                     "active": current == m.slug,
                 }
             )
+        for mix in self._active_ensemble_mixes():
+            data.append(
+                {
+                    "slug": mix.slug,
+                    "display_name": mix.display_name,
+                    "provider": "ensemble",
+                    "active": current == mix.slug,
+                    "nickname": mix.nickname,
+                    "candidates": list(mix.candidates),
+                }
+            )
         return web.json_response(data)
 
     def _valid_picker_token(self, request: web.Request) -> bool:
@@ -246,12 +258,22 @@ class ShimServer:
         if router_config is not None:
             valid.add(router_config.slug)
             display_for[router_config.slug] = router_config.display_name
+        for mix in self._active_ensemble_mixes():
+            valid.add(mix.slug)
+            valid.add(mix.nickname)
+            display_for[mix.slug] = mix.display_name
+            display_for[mix.nickname] = mix.display_name
         if chatgpt_passthrough_available():
             valid.update(chatgpt_passthrough_slugs())
             display_for.update(chatgpt_passthrough_display_names())
         if cursor_passthrough_available():
             valid.update(cursor_passthrough_display_names())
             display_for.update(cursor_passthrough_display_names())
+        # Normalize nickname → canonical slug before writing config.
+        for mix in self._active_ensemble_mixes():
+            if slug == mix.nickname:
+                slug = mix.slug
+                break
         if slug not in valid:
             return web.json_response({"error": f"unknown model: {slug}"}, status=404)
         _set_active_model(slug, display_for.get(slug, slug))
@@ -268,6 +290,8 @@ class ShimServer:
         if cursor_ok:
             passthrough_count += len(cursor_passthrough_display_names())
         count = len(models) + passthrough_count
+        ensemble_mixes = self._active_ensemble_mixes()
+        count += len(ensemble_mixes)
         return web.json_response(
             {
                 "ok": True,
@@ -275,6 +299,8 @@ class ShimServer:
                 "chatgpt_passthrough": chatgpt_ok,
                 "cursor_passthrough": cursor_ok,
                 "auto_router": self._active_router() is not None,
+                "ensemble": len(ensemble_mixes) > 0,
+                "ensemble_mixes": [m.slug for m in ensemble_mixes],
                 "auth_required": bool(self.api_key),
             }
         )
@@ -301,12 +327,17 @@ class ShimServer:
                 for slug in sorted(cursor_passthrough_display_names())
             )
         data.extend({"id": model.slug, "object": "model", "created": now, "owned_by": "codex-shim"} for model in usable_byok_models(self.settings.load()))
+        for mix in self._active_ensemble_mixes():
+            data.append(ensemble_module.models_entry(mix, now))
         return web.json_response({"object": "list", "data": data})
 
     async def chat_completions(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
         _log_incoming_request("/v1/chat/completions", body)
         body = await self._maybe_apply_auto_router(body)
+        ensemble_response = await self._maybe_ensemble(request, body, wire="chat")
+        if ensemble_response is not None:
+            return ensemble_response
         model = str(body.get("model") or "")
         if is_chatgpt_passthrough_slug(model):
             upstream = chatgpt_upstream_model(model)
@@ -381,6 +412,9 @@ class ShimServer:
         body = await request.json()
         _log_incoming_request("/v1/responses", body)
         body = await self._maybe_apply_auto_router(body)
+        ensemble_response = await self._maybe_ensemble(request, body, wire="responses")
+        if ensemble_response is not None:
+            return ensemble_response
         model = str(body.get("model") or "")
         if is_chatgpt_passthrough_slug(model):
             upstream = chatgpt_upstream_model(model)
@@ -971,6 +1005,349 @@ class ShimServer:
                 return str(message.get("content") or "")
 
         return classify
+
+    def _active_ensemble_config(self):
+        models = self.settings.load()
+        return ensemble_module.load_ensemble_config(self.settings.path, models)
+
+    def _active_ensemble_mixes(self):
+        config = self._active_ensemble_config()
+        if config is None or not config.effective_enabled:
+            return []
+        return ensemble_module.active_mixes(config, available_model_slugs(self.settings.load()))
+
+    async def _maybe_ensemble(
+        self, request: web.Request, body: dict[str, Any], wire: str
+    ) -> web.StreamResponse | None:
+        """Fan-out + Jev adjudicate + optional merge when ``model`` is an ensemble mix."""
+        config = self._active_ensemble_config()
+        if config is None or not config.effective_enabled:
+            return None
+        mix = ensemble_module.find_mix(config, str(body.get("model") or ""))
+        if mix is None:
+            return None
+        available = available_model_slugs(self.settings.load())
+        candidates = ensemble_module.filter_candidates(mix, available)
+        if len(candidates) < 2:
+            raise web.HTTPBadGateway(
+                text=f"Ensemble {mix.slug} needs ≥2 available candidates; have {candidates}"
+            )
+        want_stream = bool(body.get("stream"))
+        task = ensemble_module.extract_task_text(body)
+        if ensemble_module.ensemble_log_enabled():
+            print(f"[ensemble] {mix.slug} candidates={candidates} merge={mix.merge}", flush=True)
+
+        answers = await self._ensemble_fanout(candidates, body)
+        usable = [a for a in answers if a.text and not a.error]
+        if not usable:
+            detail = "; ".join(f"{a.slug}: {a.error or 'empty'}" for a in answers)
+            raise web.HTTPBadGateway(text=f"Ensemble {mix.slug} produced no usable answers ({detail})")
+
+        ask_merge = mix.merge == "jev"
+        decisions_body = ensemble_module.build_decisions_request(
+            config.adjudicator, task, usable, ask_merge=ask_merge
+        )
+        label_map = decisions_body.pop("_label_map")
+        try:
+            decisions_payload = await self._ensemble_decisions(config.adjudicator, decisions_body)
+        except Exception as exc:
+            if ensemble_module.ensemble_log_enabled():
+                print(f"[ensemble] decisions failed, using first usable: {exc}", flush=True)
+            decisions_payload = {
+                "model": "fallback",
+                "answers": {
+                    "winner": {"type": "choice", "choice": label_map[usable[0].slug]},
+                    "ship": {"type": "noul", "noul": 0.0},
+                },
+            }
+        verdict = ensemble_module.parse_adjudication(
+            decisions_payload,
+            label_map,
+            usable,
+            merge_mode=mix.merge,
+            merge_probability=mix.merge_probability,
+        )
+        by_slug = {a.slug: a for a in usable}
+        winner = by_slug.get(verdict.winner) or usable[0]
+        final_text = winner.text
+        source = winner.slug
+        if verdict.merge:
+            secondary = ensemble_module.pick_secondary(usable, winner.slug)
+            merge_slug = mix.merge_model if mix.merge_model in available else None
+            if secondary is not None and merge_slug:
+                try:
+                    merged = await self._ensemble_merge(merge_slug, task, winner, secondary)
+                    if merged and merged.text:
+                        final_text = merged.text
+                        source = f"merge:{winner.slug}+{secondary.slug} via {merge_slug}"
+                except Exception as exc:
+                    if ensemble_module.ensemble_log_enabled():
+                        print(f"[ensemble] merge failed, keeping winner: {exc}", flush=True)
+
+        if ensemble_module.ensemble_log_enabled():
+            print(
+                f"[ensemble] {mix.slug} winner={winner.slug} ship={verdict.ship:.2f} "
+                f"merge={verdict.merge} source={source}",
+                flush=True,
+            )
+
+        chat_payload = {
+            "id": f"ens_{uuid.uuid4().hex[:20]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": mix.slug,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": final_text},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "ensemble": {
+                "nickname": mix.nickname,
+                "winner": winner.slug,
+                "ship": verdict.ship,
+                "merge": verdict.merge,
+                "source": source,
+                "candidates": [
+                    {"slug": a.slug, "ok": not bool(a.error), "chars": len(a.text), "error": a.error}
+                    for a in answers
+                ],
+            },
+        }
+        if wire == "chat":
+            if want_stream:
+                return await self._ensemble_stream_chat(request, chat_payload)
+            return web.json_response(chat_payload)
+        responses_payload = chat_completion_to_response(chat_payload, mix.slug)
+        if want_stream:
+            return await self._ensemble_stream_responses(request, responses_payload)
+        return web.json_response(responses_payload)
+
+    async def _ensemble_fanout(
+        self, candidates: list[str], body: dict[str, Any]
+    ) -> list[ensemble_module.CandidateAnswer]:
+        import asyncio
+
+        async def one(slug: str) -> ensemble_module.CandidateAnswer:
+            try:
+                payload = await self._ensemble_complete_slug(slug, body)
+                text = ensemble_module.extract_assistant_text(payload)
+                if not text:
+                    return ensemble_module.CandidateAnswer(slug=slug, text="", raw=payload, error="empty response")
+                return ensemble_module.CandidateAnswer(slug=slug, text=text, raw=payload)
+            except Exception as exc:
+                return ensemble_module.CandidateAnswer(slug=slug, text="", error=str(exc))
+
+        return list(await asyncio.gather(*(one(slug) for slug in candidates)))
+
+    async def _ensemble_complete_slug(self, slug: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Run one candidate non-streaming and return a chat-shaped or Responses payload."""
+        probe = dict(body)
+        probe["model"] = slug
+        probe["stream"] = False
+
+        if is_chatgpt_passthrough_slug(slug):
+            upstream = chatgpt_upstream_model(slug)
+            if "messages" in probe and "input" not in probe:
+                forwarded = chat_to_responses_request(probe, upstream)
+            else:
+                forwarded = dict(probe)
+                forwarded["model"] = upstream
+            _apply_chatgpt_alias_effort(forwarded, slug)
+            forwarded["stream"] = False
+            return await self._ensemble_chatgpt_json(forwarded, slug, upstream)
+
+        if is_cursor_passthrough_slug(slug):
+            # Cursor CLI bridge: prompt-only completion for adjudication.
+            task = ensemble_module.extract_task_text(probe)
+            prompt = (
+                "Answer the coding/task request below directly. Be concise and complete.\n\n"
+                f"{task}"
+            )
+            text_parts: list[str] = []
+            async for event in iter_cursor_agent_events(prompt, cursor_upstream_model(slug)):
+                if event.get("type") == "text_delta" and isinstance(event.get("delta"), str):
+                    text_parts.append(event["delta"])
+                elif event.get("type") == "error":
+                    raise RuntimeError(str(event.get("message") or "cursor error"))
+            text = "".join(text_parts).strip() or "(cursor produced no text)"
+            return {
+                "id": f"cursor_{uuid.uuid4().hex[:12]}",
+                "object": "chat.completion",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+                "model": slug,
+            }
+
+        route = self.settings.by_slug_or_model(slug)
+        if route is None:
+            raise RuntimeError(f"unknown candidate: {slug}")
+        if not byok_model_has_credentials(route):
+            raise RuntimeError(f"missing API key for {slug}")
+
+        timeout = ClientTimeout(total=120, sock_connect=30, sock_read=120)
+        async with ClientSession(timeout=timeout) as session:
+            if route.is_openai_chat:
+                if "messages" in probe:
+                    chat_body = dict(probe)
+                    chat_body["model"] = route.model
+                    chat_body["stream"] = False
+                    if "messages" in chat_body:
+                        chat_body["messages"] = _normalize_roles(chat_body["messages"])
+                else:
+                    chat_body = responses_to_chat(probe, route.model)
+                    chat_body["stream"] = False
+                # Drop tools for ensemble probes to keep adjudication text-focused and cheaper.
+                chat_body.pop("tools", None)
+                chat_body.pop("tool_choice", None)
+                url = _join_url(route.base_url, "/chat/completions")
+                upstream = await session.post(url, json=chat_body, headers=_openai_headers(route))
+                if upstream.status >= 400:
+                    err = await upstream.text()
+                    raise RuntimeError(f"{slug} HTTP {upstream.status}: {err[:300]}")
+                return await upstream.json(content_type=None)
+            if route.is_anthropic:
+                if "messages" in probe and probe.get("messages"):
+                    anth = chat_to_anthropic(probe, route.model, route.max_output_tokens)
+                else:
+                    anth = responses_to_anthropic(probe, route.model, route.max_output_tokens)
+                anth["stream"] = False
+                anth.pop("tools", None)
+                url = _join_url(route.base_url, "/messages")
+                upstream = await session.post(url, json=anth, headers=_anthropic_headers(route))
+                if upstream.status >= 400:
+                    err = await upstream.text()
+                    raise RuntimeError(f"{slug} HTTP {upstream.status}: {err[:300]}")
+                payload = await upstream.json(content_type=None)
+                return anthropic_to_chat_response(payload, slug)
+        raise RuntimeError(f"unsupported candidate provider for {slug}")
+
+    async def _ensemble_chatgpt_json(
+        self, forwarded: dict[str, Any], slug: str, upstream_model: str
+    ) -> dict[str, Any]:
+        auth_path = DEFAULT_CODEX_AUTH.expanduser()
+        auth = json.loads(auth_path.read_text())
+        tokens = auth.get("tokens") or {}
+        access_token = tokens.get("access_token")
+        if not access_token:
+            raise RuntimeError("ChatGPT auth missing access_token")
+        account_id = tokens.get("account_id") or ""
+        body = _sanitize_chatgpt_passthrough_body(dict(forwarded))
+        body["model"] = upstream_model
+        body["store"] = False
+        body["stream"] = True
+        body.pop("tools", None)
+        body.pop("tool_choice", None)
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "OpenAI-Beta": "responses=2026-02-06",
+            "originator": "codex_cli_rs",
+            "chatgpt-account-id": account_id,
+        }
+        url = "https://chatgpt.com/backend-api/codex/responses"
+        timeout = ClientTimeout(total=180, sock_connect=30, sock_read=180)
+        async with ClientSession(timeout=timeout) as session:
+            upstream = await session.post(url, json=body, headers=headers)
+            if upstream.status >= 400:
+                err = await upstream.text()
+                raise RuntimeError(f"{slug} HTTP {upstream.status}: {err[:300]}")
+            payload = await _collect_completed_response(upstream)
+        return response_to_chat_completion(payload, slug)
+
+    async def _ensemble_decisions(self, adjudicator, body: dict[str, Any]) -> dict[str, Any]:
+        url = ensemble_module.decisions_url(adjudicator)
+        headers = {
+            "Authorization": f"Bearer {adjudicator.api_key}",
+            "Content-Type": "application/json",
+            **adjudicator.extra_headers,
+        }
+        timeout = ClientTimeout(
+            total=adjudicator.timeout + 10,
+            sock_connect=min(30.0, adjudicator.timeout),
+            sock_read=adjudicator.timeout,
+        )
+        async with ClientSession(timeout=timeout) as session:
+            upstream = await session.post(url, json=body, headers=headers)
+            if upstream.status >= 400:
+                err = await upstream.text()
+                raise RuntimeError(f"decisions HTTP {upstream.status}: {err[:400]}")
+            return await upstream.json(content_type=None)
+
+    async def _ensemble_merge(
+        self,
+        merge_slug: str,
+        task: str,
+        primary: ensemble_module.CandidateAnswer,
+        secondary: ensemble_module.CandidateAnswer,
+    ) -> ensemble_module.CandidateAnswer:
+        prompt = ensemble_module.merge_prompt(task, primary, secondary)
+        body = {
+            "model": merge_slug,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": "You merge candidate solutions into one best answer."},
+                {"role": "user", "content": prompt},
+            ],
+        }
+        payload = await self._ensemble_complete_slug(merge_slug, body)
+        text = ensemble_module.extract_assistant_text(payload)
+        return ensemble_module.CandidateAnswer(slug=merge_slug, text=text, raw=payload)
+
+    async def _ensemble_stream_chat(self, request: web.Request, payload: dict[str, Any]) -> web.StreamResponse:
+        response = web.StreamResponse(
+            status=200,
+            headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
+        )
+        await response.prepare(request)
+        message = (payload.get("choices") or [{}])[0].get("message") or {}
+        content = message.get("content") or ""
+        chunk = {
+            "id": payload.get("id"),
+            "object": "chat.completion.chunk",
+            "created": payload.get("created"),
+            "model": payload.get("model"),
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": content}, "finish_reason": None}],
+        }
+        await _write_sse(response, chunk)
+        done = {
+            "id": payload.get("id"),
+            "object": "chat.completion.chunk",
+            "created": payload.get("created"),
+            "model": payload.get("model"),
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+        await _write_sse(response, done)
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    async def _ensemble_stream_responses(
+        self, request: web.Request, payload: dict[str, Any]
+    ) -> web.StreamResponse:
+        response = web.StreamResponse(
+            status=200,
+            headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
+        )
+        await response.prepare(request)
+        await _write_sse(response, {"type": "response.created", "response": payload})
+        for item in payload.get("output") or []:
+            if isinstance(item, dict) and item.get("type") == "message":
+                for part in item.get("content") or []:
+                    if isinstance(part, dict) and part.get("type") == "output_text":
+                        await _write_sse(
+                            response,
+                            {
+                                "type": "response.output_text.delta",
+                                "delta": part.get("text") or "",
+                                "item_id": item.get("id") or "msg_0",
+                            },
+                        )
+        await _write_sse(response, {"type": "response.completed", "response": payload})
+        await response.write_eof()
+        return response
 
     def _route(self, body: dict[str, Any]) -> ShimModel:
         requested = str(body.get("model") or "")

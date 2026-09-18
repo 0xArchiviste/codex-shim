@@ -9,6 +9,16 @@ from codex_shim.hostguard import build_allowed_hosts, host_matches, host_only
 from codex_shim.server import ShimServer
 
 
+@pytest.fixture(autouse=True)
+def _isolate_public_base_url(monkeypatch, tmp_path):
+    """Keep hostguard tests independent of the operator's ~/.codex-shim files."""
+    monkeypatch.delenv("CODEX_SHIM_PUBLIC_BASE_URL", raising=False)
+    monkeypatch.setattr(
+        "codex_shim.hostguard.PUBLIC_BASE_URL_FILE",
+        tmp_path / "missing-public-base-url",
+    )
+
+
 @pytest.mark.parametrize(
     "header,expected",
     [
@@ -33,8 +43,19 @@ def test_build_allowed_hosts_defaults_to_loopback():
 
 def test_build_allowed_hosts_adds_bind_host_and_env(monkeypatch):
     monkeypatch.setenv("CODEX_SHIM_ALLOWED_HOSTS", "shim.lan , Extra.Host")
+    monkeypatch.delenv("CODEX_SHIM_PUBLIC_BASE_URL", raising=False)
     allowed = build_allowed_hosts("192.168.1.5")
     assert {"127.0.0.1", "localhost", "::1", "192.168.1.5", "shim.lan", "extra.host"} <= allowed
+
+
+def test_build_allowed_hosts_includes_public_tunnel_host(monkeypatch, tmp_path):
+    monkeypatch.setenv("CODEX_SHIM_PUBLIC_BASE_URL", "https://cabana-countdown-roaming.ngrok-free.dev/v1")
+    monkeypatch.delenv("CODEX_SHIM_ALLOWED_HOSTS", raising=False)
+    allowed = build_allowed_hosts("127.0.0.1")
+    assert "cabana-countdown-roaming.ngrok-free.dev" in allowed
+    assert "*.ngrok-free.dev" in allowed
+    assert host_matches("cabana-countdown-roaming.ngrok-free.dev", allowed) is True
+    assert host_matches("other.ngrok-free.dev", allowed) is True
 
 
 def test_build_allowed_hosts_ignores_wildcard_bind():

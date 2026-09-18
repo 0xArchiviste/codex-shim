@@ -46,6 +46,14 @@ local:
   uses a cheap classifier model to route each task to the cheapest configured
   model that can handle it — trivial turns stay cheap, hard turns escalate. See
   [`docs/AUTO_ROUTER.md`](docs/AUTO_ROUTER.md).
+- **Jev ensembles (experimental / parked follow-up).** Named mixes can fan out
+  to several models and ask Jev to pick a winner. Large-prompt adjudication is
+  earmarked for later — see [`docs/ENSEMBLE_JEV.md`](docs/ENSEMBLE_JEV.md).
+- **ChatGPT Web compatibility (parked).** Future `csb-*` slugs (e.g.
+  `csb-sol-medium`) for ChatGPT Web / browser quota via
+  [codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web), kept
+  separate from Codex-backend `cs-*`. See
+  [`docs/CHATGPT_WEB_COMPAT.md`](docs/CHATGPT_WEB_COMPAT.md).
 - **Prompt-catching/proxy-friendly architecture.** Put a local proxy in front
   of the shim to dedupe boilerplate, inject stable instructions, repair
   pseudo-tool text, or route prompts by policy before they hit an upstream.

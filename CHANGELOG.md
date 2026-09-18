@@ -7,6 +7,18 @@ and this project does not yet follow semantic versioning (pre-1.0).
 
 ## Unreleased
 
+### Notes
+
+- Jev ensemble large-input adjudication is **parked**. See
+  [`docs/ENSEMBLE_JEV.md`](docs/ENSEMBLE_JEV.md) for the earmarked follow-up
+  (`score_each`, compress-then-choice, tournament, structured cards). Current
+  mixes still use blunt truncation against Jev’s ~32k branch limit.
+- ChatGPT **Web** (browser quota) compatibility with
+  [miuuyy/codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web) is
+  **parked**. Reserved slug prefix `csb-*` (e.g. `csb-sol-medium`) so Web
+  models never collide with Codex-backend `cs-*`. See
+  [`docs/CHATGPT_WEB_COMPAT.md`](docs/CHATGPT_WEB_COMPAT.md).
+
 ### Added
 
 - `codex-shim doctor`, a read-only local diagnostics command covering Python,

@@ -19,6 +19,7 @@ import re
 import struct
 from urllib.request import urlopen
 
+from . import ensemble as ensemble_module
 from . import router as router_module
 from .catalog import _toml_escape, codex_config_overrides, write_catalog, write_config
 from .cursor_passthrough import (
@@ -205,6 +206,15 @@ def _active_router(models, settings_path: Path):
     if config and router_module.router_is_active(config, available_model_slugs(models)):
         return config
     return None
+
+
+def _active_ensemble_mixes(models, settings_path: Path):
+    from . import ensemble as ensemble_module
+
+    config = ensemble_module.load_ensemble_config(Path(settings_path).expanduser(), models)
+    if config is None or not config.effective_enabled:
+        return []
+    return ensemble_module.active_mixes(config, available_model_slugs(models))
 
 
 @dataclass(frozen=True)
@@ -532,11 +542,14 @@ def generate(settings_path: Path, port: int) -> None:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     router_config = router_module.load_router_config(Path(settings_path).expanduser())
-    write_catalog(models, CATALOG_PATH, router_config=router_config)
+    ensemble_mixes = _active_ensemble_mixes(models, settings_path)
+    write_catalog(models, CATALOG_PATH, router_config=router_config, ensemble_mixes=ensemble_mixes)
     write_config(models, CONFIG_PATH, CATALOG_PATH, port)
     print(f"Generated {len(models)} model entries:")
     if _active_router(models, settings_path) is not None:
         print(f"  auto router: {router_config.slug} ({router_config.display_name})")
+    if ensemble_mixes:
+        print(f"  ensembles: {', '.join(m.slug for m in ensemble_mixes)}")
     print(f"  catalog: {CATALOG_PATH}")
     print(f"  config:  {CONFIG_PATH}")
     print("No files under ~/.codex were modified.")
@@ -603,6 +616,15 @@ def list_models(settings_path: Path) -> int:
         for slug, display_name in cursor_passthrough_display_names().items():
             rows.append((slug, display_name, "composer-2.5", "cursor-subscription"))
     rows.extend((model.slug, model.display_name, model.model, model.provider) for model in usable_byok_models(models))
+    for mix in _active_ensemble_mixes(models, settings_path):
+        rows.append(
+            (
+                mix.slug,
+                f"{mix.display_name} [{mix.nickname}]",
+                "+".join(mix.candidates),
+                f"ensemble/{mix.merge}",
+            )
+        )
     for model in models:
         if model not in usable_byok_models(models):
             rows.append((model.slug, f"{model.display_name} (missing API key)", model.model, model.provider))
@@ -636,9 +658,7 @@ def start(settings_path: Path, port: int) -> int:
         "--port",
         str(port),
     ]
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(PROJECT_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
-    env["CODEX_SHIM_API_KEY"] = ensure_shim_api_key()
+    env = _daemon_env()
     process = _popen_daemon(cmd, log, env)
     PID_PATH.write_text(str(process.pid))
     for _ in range(50):
@@ -1165,6 +1185,55 @@ def _remove_section(text: str, section: str) -> str:
         if not skipping:
             output.append(line)
     return "\n".join(output) + ("\n" if text.endswith("\n") else "")
+
+
+def _daemon_env() -> dict[str, str]:
+    """Environment for the shim daemon, including persisted tunnel allowlists.
+
+    Manual ``codex-shim start`` previously spawned without the systemd unit's
+    ``CODEX_SHIM_ALLOWED_HOSTS``, which locked ngrok out. Always merge
+    ``~/.codex-shim/reverse-byok.env`` and keep the standard ngrok patterns.
+    """
+    from .hostguard import DEFAULT_TUNNEL_HOST_PATTERNS, PUBLIC_BASE_URL_ENV
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(PROJECT_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    env["CODEX_SHIM_API_KEY"] = ensure_shim_api_key()
+    _merge_dotenv(env, Path.home() / ".codex-shim" / "reverse-byok.env")
+
+    public = env.get(PUBLIC_BASE_URL_ENV, "").strip()
+    if not public:
+        try:
+            public = (Path.home() / ".codex-shim" / "public-base-url").read_text().strip()
+        except OSError:
+            public = ""
+    if public:
+        env.setdefault(PUBLIC_BASE_URL_ENV, public)
+        existing = [p.strip() for p in env.get("CODEX_SHIM_ALLOWED_HOSTS", "").split(",") if p.strip()]
+        merged = list(dict.fromkeys([*existing, *DEFAULT_TUNNEL_HOST_PATTERNS]))
+        env["CODEX_SHIM_ALLOWED_HOSTS"] = ",".join(merged)
+    return env
+
+
+def _merge_dotenv(env: dict[str, str], path: Path) -> None:
+    """Load KEY=VALUE lines into ``env`` without overriding already-set keys."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'").strip('"')
+        if key and key not in env:
+            env[key] = value
 
 
 def _popen_daemon(cmd: list[str], log, env: dict[str, str]) -> subprocess.Popen:

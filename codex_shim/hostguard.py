@@ -16,11 +16,24 @@ bind host the operator configured, reject everything else.
 from __future__ import annotations
 
 import os
+from pathlib import Path
+from urllib.parse import urlparse
 
 from aiohttp import web
 
 DEFAULT_ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 ALLOWED_HOSTS_ENV = "CODEX_SHIM_ALLOWED_HOSTS"
+PUBLIC_BASE_URL_ENV = "CODEX_SHIM_PUBLIC_BASE_URL"
+PUBLIC_BASE_URL_FILE = Path.home() / ".codex-shim" / "public-base-url"
+# Kept in sync with the systemd unit / reverse-byok.env so CLI restarts
+# still accept the ngrok tunnel Host header.
+DEFAULT_TUNNEL_HOST_PATTERNS = (
+    "*.ngrok-free.app",
+    "*.ngrok-free.dev",
+    "*.ngrok.app",
+    "*.ngrok.io",
+    "*.ngrok.dev",
+)
 _WILDCARD_BINDS = frozenset({"", "0.0.0.0", "::"})
 
 
@@ -39,8 +52,31 @@ def host_only(host_header: str) -> str:
     return value
 
 
+def _hostname_from_url(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        return (urlparse(raw).hostname or "").strip().lower()
+    except ValueError:
+        return ""
+
+
+def public_base_url() -> str:
+    """Configured public base URL from env, else ``~/.codex-shim/public-base-url``."""
+    env = os.environ.get(PUBLIC_BASE_URL_ENV, "").strip()
+    if env:
+        return env
+    try:
+        return PUBLIC_BASE_URL_FILE.read_text().strip()
+    except OSError:
+        return ""
+
+
 def build_allowed_hosts(bind_host: str) -> set[str]:
-    """Loopback names + the configured bind host + the env allowlist."""
+    """Loopback names + bind host + env allowlist + public tunnel hosts."""
     allowed = {host.lower() for host in DEFAULT_ALLOWED_HOSTS}
     bind = (bind_host or "").strip().lower()
     if bind and bind not in _WILDCARD_BINDS:
@@ -49,6 +85,16 @@ def build_allowed_hosts(bind_host: str) -> set[str]:
         part = part.strip().lower()
         if part:
             allowed.add(part)
+
+    public = public_base_url()
+    public_host = _hostname_from_url(public)
+    if public_host:
+        allowed.add(public_host)
+        # Tunnel hostnames rotate; keep the standard ngrok patterns available
+        # whenever a public base URL is configured so CLI restarts do not
+        # accidentally lock the tunnel out.
+        for pattern in DEFAULT_TUNNEL_HOST_PATTERNS:
+            allowed.add(pattern.lower())
     return allowed
 
 
