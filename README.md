@@ -637,6 +637,45 @@ GLM, etc.) round-trip through `reasoning.encrypted_content` items.
 
 ---
 
+## Jev IO context profiles
+
+Jev IO is an opt-in, reversible context layer for large Read/Bash/Grep results.
+It exposes `cs-sol-jev-io` and `cs-sol-jev-io-max`, both backed by
+`cs-sol-medium`. The max profile additionally enables conservative prompt and
+terminal-prose refinement when a generative rewriter is configured. Internal
+recall is buffered, so its tool calls are never sent to the client.
+
+Add a top-level block to `~/.codex-shim/models.json` and regenerate the catalog:
+
+```jsonc
+"jev_io": {
+  "enabled": true,
+  "adjudicator": {
+    "api_key_env": "OPENROUTER_API_KEY",
+    "model": "~typesafe/jev-latest"
+  },
+  "rewriter": {
+    "api_key_env": "OPENROUTER_API_KEY",
+    "model": "openai/gpt-5-mini"
+  },
+  "defaults": {
+    "rollout": "shadow",
+    "retrieval_roots": ["/absolute/path/to/workspace"]
+  }
+}
+```
+
+`shadow` calls the judge and records recoverable artifacts without changing
+model-visible content. Change a profile to `"rollout": "active"` only after
+replay/labeling on your workload. Filtering fails open when Jev, storage, scope,
+or optional ColGREP retrieval is unavailable. Exact hiding requires a stable
+`session_id` request header; unscoped requests remain unchanged. ColGREP is
+never installed automatically and is skipped when its binary/index is absent.
+The rewriter is optional; without it the max profile behaves like ordinary IO
+for prompt/answer rewriting.
+
+---
+
 ## Auto Router (smart routing)
 
 Optionally add one extra picker entry — **`Auto (smart routing)`** (slug

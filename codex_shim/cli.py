@@ -21,6 +21,7 @@ from urllib.request import urlopen
 
 from . import ensemble as ensemble_module
 from . import router as router_module
+from . import io_profiles as io_profiles_module
 from .catalog import _toml_escape, codex_config_overrides, write_catalog, write_config
 from .cursor_passthrough import (
     cursor_passthrough_available,
@@ -543,13 +544,17 @@ def generate(settings_path: Path, port: int) -> None:
         raise SystemExit(str(exc)) from exc
     router_config = router_module.load_router_config(Path(settings_path).expanduser())
     ensemble_mixes = _active_ensemble_mixes(models, settings_path)
-    write_catalog(models, CATALOG_PATH, router_config=router_config, ensemble_mixes=ensemble_mixes)
+    io_config = io_profiles_module.load_io_config(settings_path, models)
+    io_profiles = io_profiles_module.active_profiles(io_config)
+    write_catalog(models, CATALOG_PATH, router_config=router_config, ensemble_mixes=ensemble_mixes, io_profiles=io_profiles)
     write_config(models, CONFIG_PATH, CATALOG_PATH, port)
     print(f"Generated {len(models)} model entries:")
     if _active_router(models, settings_path) is not None:
         print(f"  auto router: {router_config.slug} ({router_config.display_name})")
     if ensemble_mixes:
         print(f"  ensembles: {', '.join(m.slug for m in ensemble_mixes)}")
+    if io_profiles:
+        print(f"  jev io: {', '.join(p.slug for p in io_profiles)}")
     print(f"  catalog: {CATALOG_PATH}")
     print(f"  config:  {CONFIG_PATH}")
     print("No files under ~/.codex were modified.")

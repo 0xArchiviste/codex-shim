@@ -102,7 +102,7 @@ def chatgpt_passthrough_entry() -> dict:
     return chatgpt_passthrough_entries()[0]
 
 
-def write_catalog(models: list[ShimModel], path: Path, router_config=None, ensemble_mixes=None) -> Path:
+def write_catalog(models: list[ShimModel], path: Path, router_config=None, ensemble_mixes=None, io_profiles=None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     entries: list[dict] = []
     if router_config is not None and router_module.router_is_active(router_config, available_model_slugs(models)):
@@ -118,6 +118,10 @@ def write_catalog(models: list[ShimModel], path: Path, router_config=None, ensem
         from . import ensemble as ensemble_module
 
         entries.extend(ensemble_module.catalog_entry(mix) for mix in ensemble_mixes)
+    if io_profiles:
+        from . import io_profiles as io_profiles_module
+
+        entries.extend(io_profiles_module.catalog_entry(profile) for profile in io_profiles)
     payload = {"models": entries}
     path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n")
     return path

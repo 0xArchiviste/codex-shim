@@ -25,6 +25,11 @@ from .cursor_passthrough import (
 )
 from . import ensemble as ensemble_module
 from . import router as router_module
+from . import io_profiles as io_profiles_module
+from .context_sieve import extract_task, sieve_request
+from .context_store import ContextStore
+from .io_runtime import refine_request_input, replace_terminal_text, rewrite_text, run_recall_loop
+from .retrieval import colgrep_search, retrieval_context
 from .hostguard import build_allowed_hosts, host_guard_middleware
 from .settings import (
     CHATGPT_MODEL_SLUG,
@@ -75,6 +80,24 @@ from .translate import (
 DEBUG_DIR = Path(__file__).resolve().parents[1] / ".codex-shim"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 PICKER_TOKEN_HEADER = "X-Codex-Shim-Picker-Token"
+
+
+def io_runtime_has_nontext_output(payload: dict[str, Any]) -> bool:
+    if (payload.get("choices") or [{}])[0].get("message", {}).get("tool_calls"):
+        return True
+    return any(
+        isinstance(item, dict) and item.get("type") != "message"
+        for item in (payload.get("output") or [])
+    )
+
+
+def io_runtime_has_code_artifact(payload: dict[str, Any], text: str) -> bool:
+    if "```" in text or "*** Begin Patch" in text:
+        return True
+    fmt = payload.get("text") or payload.get("response_format") or {}
+    if isinstance(fmt, dict) and fmt.get("format", {}).get("type") in {"json_schema", "json_object"}:
+        return True
+    return False
 
 
 def chatgpt_debug_enabled() -> bool:
@@ -158,6 +181,7 @@ class ShimServer:
         self.timeout = ClientTimeout(total=None, sock_connect=120, sock_read=None)
         self.picker_token = secrets.token_urlsafe(32)
         self.api_key = load_shim_api_key()
+        self.context_store = ContextStore()
 
     def app(self) -> web.Application:
         allowed_hosts = build_allowed_hosts(self.host)
@@ -235,6 +259,8 @@ class ShimServer:
                     "candidates": list(mix.candidates),
                 }
             )
+        for profile in io_profiles_module.active_profiles(self._active_io_config()):
+            data.append({"slug": profile.slug, "display_name": profile.display_name, "provider": "jev-io", "active": current == profile.slug})
         return web.json_response(data)
 
     def _valid_picker_token(self, request: web.Request) -> bool:
@@ -263,6 +289,9 @@ class ShimServer:
             valid.add(mix.nickname)
             display_for[mix.slug] = mix.display_name
             display_for[mix.nickname] = mix.display_name
+        for profile in io_profiles_module.active_profiles(self._active_io_config()):
+            valid.add(profile.slug)
+            display_for[profile.slug] = profile.display_name
         if chatgpt_passthrough_available():
             valid.update(chatgpt_passthrough_slugs())
             display_for.update(chatgpt_passthrough_display_names())
@@ -292,6 +321,8 @@ class ShimServer:
         count = len(models) + passthrough_count
         ensemble_mixes = self._active_ensemble_mixes()
         count += len(ensemble_mixes)
+        io_profiles = io_profiles_module.active_profiles(self._active_io_config())
+        count += len(io_profiles)
         return web.json_response(
             {
                 "ok": True,
@@ -301,6 +332,8 @@ class ShimServer:
                 "auto_router": self._active_router() is not None,
                 "ensemble": len(ensemble_mixes) > 0,
                 "ensemble_mixes": [m.slug for m in ensemble_mixes],
+                "jev_io": [p.slug for p in io_profiles],
+                "jev_io_store": self.context_store.stats(),
                 "auth_required": bool(self.api_key),
             }
         )
@@ -329,6 +362,8 @@ class ShimServer:
         data.extend({"id": model.slug, "object": "model", "created": now, "owned_by": "codex-shim"} for model in usable_byok_models(self.settings.load()))
         for mix in self._active_ensemble_mixes():
             data.append(ensemble_module.models_entry(mix, now))
+        for profile in io_profiles_module.active_profiles(self._active_io_config()):
+            data.append(io_profiles_module.models_entry(profile, now))
         return web.json_response({"object": "list", "data": data})
 
     async def chat_completions(self, request: web.Request) -> web.StreamResponse:
@@ -338,6 +373,9 @@ class ShimServer:
         ensemble_response = await self._maybe_ensemble(request, body, wire="chat")
         if ensemble_response is not None:
             return ensemble_response
+        io_response = await self._maybe_io_profile(request, body, wire="chat")
+        if io_response is not None:
+            return io_response
         model = str(body.get("model") or "")
         if is_chatgpt_passthrough_slug(model):
             upstream = chatgpt_upstream_model(model)
@@ -415,6 +453,9 @@ class ShimServer:
         ensemble_response = await self._maybe_ensemble(request, body, wire="responses")
         if ensemble_response is not None:
             return ensemble_response
+        io_response = await self._maybe_io_profile(request, body, wire="responses")
+        if io_response is not None:
+            return io_response
         model = str(body.get("model") or "")
         if is_chatgpt_passthrough_slug(model):
             upstream = chatgpt_upstream_model(model)
@@ -450,6 +491,12 @@ class ShimServer:
         _log_incoming_request("/v1/responses/compact", body)
         body = await self._maybe_apply_auto_router(body)
         model = str(body.get("model") or "")
+        io_profile = io_profiles_module.find_profile(self._active_io_config(), model)
+        if io_profile is not None:
+            compact_body = dict(body)
+            compact_body["model"] = io_profile.base_model
+            upstream = chatgpt_upstream_model(io_profile.base_model)
+            return await self._chatgpt_compact_passthrough(request, compact_body, upstream_model=upstream)
         if is_chatgpt_passthrough_slug(model):
             upstream = chatgpt_upstream_model(model)
             return await self._chatgpt_compact_passthrough(request, body, upstream_model=upstream)
@@ -1348,6 +1395,170 @@ class ShimServer:
         await _write_sse(response, {"type": "response.completed", "response": payload})
         await response.write_eof()
         return response
+
+    def _active_io_config(self):
+        return io_profiles_module.load_io_config(self.settings.path, self.settings.load())
+
+    async def _maybe_io_profile(
+        self, request: web.Request, body: dict[str, Any], wire: str
+    ) -> web.StreamResponse | None:
+        config = self._active_io_config()
+        profile = io_profiles_module.find_profile(config, str(body.get("model") or ""))
+        if profile is None:
+            return None
+        if profile.base_model in {p.slug for p in config.profiles}:
+            raise web.HTTPBadRequest(text="Jev IO profile base_model cannot reference another IO profile")
+        requested_stream = bool(body.get("stream"))
+        upstream_model = chatgpt_upstream_model(profile.base_model)
+        normalized = chat_to_responses_request(body, upstream_model) if wire == "chat" else dict(body)
+        normalized["model"] = upstream_model
+        normalized["stream"] = False
+        _apply_chatgpt_alias_effort(normalized, profile.base_model)
+        task = extract_task(body)
+        scope = self._io_scope(request)
+
+        judge = None
+        if config.adjudicator is not None:
+            judge = io_profiles_module.OpenRouterDecisionsJudge(config.adjudicator, self._io_decisions_post)
+        sieved = await sieve_request(
+            normalized, task=task, scope=scope, profile=profile, judge=judge, store=self.context_store
+        )
+        prepared = sieved.body
+
+        if profile.retrieval_roots:
+            rows = await colgrep_search(task, profile.retrieval_roots, profile.retrieval_results)
+            context = retrieval_context(rows)
+            if context:
+                prepared = refine_request_input(prepared, context)
+
+        if profile.rewrite_input and config.rewriter is not None:
+            try:
+                brief = await rewrite_text(
+                    config.rewriter, purpose="concise task brief", original=task, task=task,
+                    post_json=self._io_rewriter_post,
+                )
+                prepared = refine_request_input(prepared, brief)
+            except Exception:
+                pass
+
+        async def complete(probe: dict[str, Any]) -> dict[str, Any]:
+            return await self._io_chatgpt_json(probe, upstream_model)
+
+        try:
+            payload = await run_recall_loop(
+                prepared, scope=scope, profile=profile, store=self.context_store, complete=complete
+            )
+        except RuntimeError as exc:
+            raise web.HTTPBadGateway(text=str(exc)) from exc
+        _rewrite_response_model(payload, profile.slug)
+
+        if profile.rewrite_output and config.rewriter is not None:
+            original = ensemble_module.extract_assistant_text(payload)
+            if original and not io_runtime_has_nontext_output(payload) and not io_runtime_has_code_artifact(payload, original):
+                try:
+                    refined = await rewrite_text(
+                        config.rewriter, purpose="final assistant prose", original=original, task=task,
+                        post_json=self._io_rewriter_post,
+                    )
+                    payload = replace_terminal_text(payload, refined)
+                except Exception:
+                    pass
+
+        if wire == "chat":
+            chat_payload = response_to_chat_completion(payload, profile.slug)
+            if requested_stream:
+                return await self._io_stream_chat(request, chat_payload)
+            return web.json_response(chat_payload)
+        if requested_stream:
+            return await self._io_stream_responses(request, payload)
+        return web.json_response(payload)
+
+    async def _io_stream_chat(self, request: web.Request, payload: dict[str, Any]) -> web.StreamResponse:
+        response = _sse_response()
+        await response.prepare(request)
+        message = (payload.get("choices") or [{}])[0].get("message") or {}
+        delta = {key: value for key, value in message.items() if key in {"role", "content", "tool_calls"}}
+        await _write_sse(response, {
+            "id": payload.get("id"), "object": "chat.completion.chunk", "created": payload.get("created"),
+            "model": payload.get("model"), "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+        })
+        finish = "tool_calls" if message.get("tool_calls") else "stop"
+        await _write_sse(response, {
+            "id": payload.get("id"), "object": "chat.completion.chunk", "created": payload.get("created"),
+            "model": payload.get("model"), "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+        })
+        await _safe_write(response, b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    async def _io_stream_responses(self, request: web.Request, payload: dict[str, Any]) -> web.StreamResponse:
+        response = _sse_response()
+        await response.prepare(request)
+        await _write_sse(response, {"type": "response.created", "response": {**payload, "output": []}})
+        for index, item in enumerate(payload.get("output") or []):
+            if not isinstance(item, dict):
+                continue
+            await _write_sse(response, {"type": "response.output_item.added", "output_index": index, "item": item})
+            if item.get("type") == "message":
+                for part_index, part in enumerate(item.get("content") or []):
+                    if isinstance(part, dict) and part.get("type") == "output_text":
+                        await _write_sse(response, {"type": "response.output_text.delta", "output_index": index, "content_index": part_index, "item_id": item.get("id"), "delta": part.get("text") or ""})
+                        await _write_sse(response, {"type": "response.output_text.done", "output_index": index, "content_index": part_index, "item_id": item.get("id"), "text": part.get("text") or ""})
+            await _write_sse(response, {"type": "response.output_item.done", "output_index": index, "item": item})
+        await _write_sse(response, {"type": "response.completed", "response": payload})
+        await response.write_eof()
+        return response
+
+    def _io_scope(self, request: web.Request) -> str:
+        session = request.headers.get("session_id", "").strip()
+        if not session:
+            return ""
+        import hashlib
+        owner = _request_api_key(request) if self.api_key else "local"
+        return hashlib.sha256(f"{owner}:{session}".encode()).hexdigest()
+
+    async def _io_decisions_post(self, url: str, body: dict[str, Any], adjudicator) -> dict[str, Any]:
+        headers = {
+            "Authorization": f"Bearer {adjudicator.api_key}",
+            "Content-Type": "application/json",
+            **adjudicator.extra_headers,
+        }
+        timeout = ClientTimeout(total=adjudicator.timeout + 10, sock_connect=min(30.0, adjudicator.timeout), sock_read=adjudicator.timeout)
+        async with ClientSession(timeout=timeout) as session:
+            upstream = await session.post(url, json=body, headers=headers)
+            if upstream.status >= 400:
+                raise RuntimeError(f"decisions HTTP {upstream.status}: {(await upstream.text())[:400]}")
+            return await upstream.json(content_type=None)
+
+    async def _io_rewriter_post(self, url: str, body: dict[str, Any], headers: dict[str, str], timeout_value: float) -> dict[str, Any]:
+        timeout = ClientTimeout(total=timeout_value + 10, sock_connect=min(30.0, timeout_value), sock_read=timeout_value)
+        async with ClientSession(timeout=timeout) as session:
+            upstream = await session.post(url, json=body, headers=headers)
+            if upstream.status >= 400:
+                raise RuntimeError(f"rewriter HTTP {upstream.status}: {(await upstream.text())[:400]}")
+            return await upstream.json(content_type=None)
+
+    async def _io_chatgpt_json(self, body: dict[str, Any], upstream_model: str) -> dict[str, Any]:
+        auth = json.loads(DEFAULT_CODEX_AUTH.expanduser().read_text())
+        tokens = auth.get("tokens") or {}
+        access_token = tokens.get("access_token")
+        if not access_token:
+            raise RuntimeError("ChatGPT auth missing access_token")
+        forwarded = _sanitize_chatgpt_passthrough_body(dict(body))
+        forwarded["model"] = upstream_model
+        forwarded["store"] = False
+        forwarded["stream"] = True
+        headers = {
+            "Authorization": f"Bearer {access_token}", "Content-Type": "application/json",
+            "Accept": "text/event-stream", "OpenAI-Beta": "responses=2026-02-06",
+            "originator": "codex_cli_rs", "chatgpt-account-id": tokens.get("account_id") or "",
+        }
+        timeout = ClientTimeout(total=180, sock_connect=30, sock_read=180)
+        async with ClientSession(timeout=timeout) as session:
+            upstream = await session.post("https://chatgpt.com/backend-api/codex/responses", json=forwarded, headers=headers)
+            if upstream.status >= 400:
+                raise RuntimeError(f"ChatGPT HTTP {upstream.status}: {(await upstream.text())[:400]}")
+            return await _collect_completed_response(upstream)
 
     def _route(self, body: dict[str, Any]) -> ShimModel:
         requested = str(body.get("model") or "")
