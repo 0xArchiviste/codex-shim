@@ -110,9 +110,14 @@ def write_catalog(models: list[ShimModel], path: Path, router_config=None, ensem
     if chatgpt_passthrough_available():
         entries.extend(chatgpt_passthrough_entries())
     if cursor_passthrough_available():
-        entry = cursor_catalog_entry()
-        entry["isDefault"] = not chatgpt_passthrough_available()
-        entries.append(entry)
+        from .cursor_passthrough import cursor_passthrough_display_names
+
+        for slug in cursor_passthrough_display_names():
+            entry = cursor_catalog_entry(slug)
+            entry["isDefault"] = (
+                slug == "composer-2-5" and not chatgpt_passthrough_available()
+            )
+            entries.append(entry)
     entries.extend(catalog_entry(model) for model in usable_byok_models(models))
     if ensemble_mixes:
         from . import ensemble as ensemble_module

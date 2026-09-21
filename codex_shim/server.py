@@ -28,7 +28,13 @@ from . import router as router_module
 from . import io_profiles as io_profiles_module
 from .context_sieve import extract_task, sieve_request
 from .context_store import ContextStore
-from .io_runtime import refine_request_input, replace_terminal_text, rewrite_text, run_recall_loop
+from .io_runtime import (
+    recall_calls,
+    refine_request_input,
+    replace_terminal_text,
+    rewrite_text,
+    run_recall_loop,
+)
 from .retrieval import colgrep_search, retrieval_context
 from .hostguard import build_allowed_hosts, host_guard_middleware
 from .settings import (
@@ -259,7 +265,7 @@ class ShimServer:
                     "candidates": list(mix.candidates),
                 }
             )
-        for profile in io_profiles_module.active_profiles(self._active_io_config()):
+        for profile in self._active_io_profiles():
             data.append({"slug": profile.slug, "display_name": profile.display_name, "provider": "jev-io", "active": current == profile.slug})
         return web.json_response(data)
 
@@ -289,7 +295,7 @@ class ShimServer:
             valid.add(mix.nickname)
             display_for[mix.slug] = mix.display_name
             display_for[mix.nickname] = mix.display_name
-        for profile in io_profiles_module.active_profiles(self._active_io_config()):
+        for profile in self._active_io_profiles():
             valid.add(profile.slug)
             display_for[profile.slug] = profile.display_name
         if chatgpt_passthrough_available():
@@ -321,7 +327,7 @@ class ShimServer:
         count = len(models) + passthrough_count
         ensemble_mixes = self._active_ensemble_mixes()
         count += len(ensemble_mixes)
-        io_profiles = io_profiles_module.active_profiles(self._active_io_config())
+        io_profiles = self._active_io_profiles()
         count += len(io_profiles)
         return web.json_response(
             {
@@ -362,7 +368,7 @@ class ShimServer:
         data.extend({"id": model.slug, "object": "model", "created": now, "owned_by": "codex-shim"} for model in usable_byok_models(self.settings.load()))
         for mix in self._active_ensemble_mixes():
             data.append(ensemble_module.models_entry(mix, now))
-        for profile in io_profiles_module.active_profiles(self._active_io_config()):
+        for profile in self._active_io_profiles():
             data.append(io_profiles_module.models_entry(profile, now))
         return web.json_response({"object": "list", "data": data})
 
@@ -494,9 +500,25 @@ class ShimServer:
         io_profile = io_profiles_module.find_profile(self._active_io_config(), model)
         if io_profile is not None:
             compact_body = dict(body)
-            compact_body["model"] = io_profile.base_model
-            upstream = chatgpt_upstream_model(io_profile.base_model)
-            return await self._chatgpt_compact_passthrough(request, compact_body, upstream_model=upstream)
+            base_slug = io_profile.base_model or io_profile.candidates[0]
+            compact_body["model"] = base_slug
+            if is_cursor_passthrough_slug(base_slug):
+                compact_body["input"] = body.get("input") or []
+                compact_body["instructions"] = (
+                    f"{body.get('instructions') or ''}\n\nSummarize the conversation "
+                    "above into a compact context window suitable for continuing the task."
+                ).strip()
+                return await self._cursor_passthrough(
+                    request,
+                    compact_body,
+                    response_model_override=model,
+                    upstream_model=cursor_upstream_model(base_slug),
+                    force_non_stream=True,
+                )
+            upstream = chatgpt_upstream_model(base_slug)
+            return await self._chatgpt_compact_passthrough(
+                request, compact_body, upstream_model=upstream
+            )
         if is_chatgpt_passthrough_slug(model):
             upstream = chatgpt_upstream_model(model)
             return await self._chatgpt_compact_passthrough(request, body, upstream_model=upstream)
@@ -1399,6 +1421,13 @@ class ShimServer:
     def _active_io_config(self):
         return io_profiles_module.load_io_config(self.settings.path, self.settings.load())
 
+    def _active_io_profiles(self):
+        models = self.settings.load()
+        return io_profiles_module.active_profiles(
+            io_profiles_module.load_io_config(self.settings.path, models),
+            available_model_slugs(models),
+        )
+
     async def _maybe_io_profile(
         self, request: web.Request, body: dict[str, Any], wire: str
     ) -> web.StreamResponse | None:
@@ -1406,14 +1435,26 @@ class ShimServer:
         profile = io_profiles_module.find_profile(config, str(body.get("model") or ""))
         if profile is None:
             return None
+        active_slugs = {item.slug for item in self._active_io_profiles()}
+        if profile.slug not in active_slugs:
+            raise web.HTTPUnauthorized(
+                text=f"Jev IO base transport is unavailable for {profile.slug}"
+            )
         if profile.base_model in {p.slug for p in config.profiles}:
             raise web.HTTPBadRequest(text="Jev IO profile base_model cannot reference another IO profile")
+        if not profile.base_model and not profile.candidates:
+            raise web.HTTPBadRequest(text=f"Jev IO profile {profile.slug} has no base model or candidates")
         requested_stream = bool(body.get("stream"))
-        upstream_model = chatgpt_upstream_model(profile.base_model)
-        normalized = chat_to_responses_request(body, upstream_model) if wire == "chat" else dict(body)
-        normalized["model"] = upstream_model
+        primary_slug = profile.base_model or profile.candidates[0]
+        if is_cursor_passthrough_slug(primary_slug):
+            transport_model = cursor_upstream_model(primary_slug)
+        else:
+            transport_model = chatgpt_upstream_model(primary_slug)
+        normalized = chat_to_responses_request(body, transport_model) if wire == "chat" else dict(body)
+        normalized["model"] = transport_model
         normalized["stream"] = False
-        _apply_chatgpt_alias_effort(normalized, profile.base_model)
+        if is_chatgpt_passthrough_slug(primary_slug):
+            _apply_chatgpt_alias_effort(normalized, primary_slug)
         task = extract_task(body)
         scope = self._io_scope(request)
 
@@ -1442,7 +1483,11 @@ class ShimServer:
                 pass
 
         async def complete(probe: dict[str, Any]) -> dict[str, Any]:
-            return await self._io_chatgpt_json(probe, upstream_model)
+            if profile.candidates:
+                return await self._io_complete_candidates(
+                    probe, profile.candidates, config.adjudicator, task
+                )
+            return await self._io_complete_model(probe, profile.base_model)
 
         try:
             payload = await run_recall_loop(
@@ -1451,6 +1496,7 @@ class ShimServer:
         except RuntimeError as exc:
             raise web.HTTPBadGateway(text=str(exc)) from exc
         _rewrite_response_model(payload, profile.slug)
+        payload["model"] = profile.slug
 
         if profile.rewrite_output and config.rewriter is not None:
             original = ensemble_module.extract_assistant_text(payload)
@@ -1559,6 +1605,166 @@ class ShimServer:
             if upstream.status >= 400:
                 raise RuntimeError(f"ChatGPT HTTP {upstream.status}: {(await upstream.text())[:400]}")
             return await _collect_completed_response(upstream)
+
+    async def _io_complete_model(
+        self, body: dict[str, Any], slug: str, *, read_only: bool = False
+    ) -> dict[str, Any]:
+        if is_cursor_passthrough_slug(slug):
+            return await self._io_cursor_json(body, slug, read_only=read_only)
+        if is_chatgpt_passthrough_slug(slug):
+            upstream = chatgpt_upstream_model(slug)
+            forwarded = dict(body)
+            forwarded["model"] = upstream
+            _apply_chatgpt_alias_effort(forwarded, slug)
+            return await self._io_chatgpt_json(forwarded, upstream)
+        raise RuntimeError(f"unsupported Jev IO base model: {slug}")
+
+    async def _io_cursor_json(
+        self, body: dict[str, Any], slug: str, *, read_only: bool = False
+    ) -> dict[str, Any]:
+        prompt = build_cursor_prompt(body)
+        prompt += (
+            "\n\n[INTERNAL JEV IO RECALL]\n"
+            "Some prior tool output may contain a [jev-io] exact recall key. "
+            "If hidden content is required, output only "
+            '<jev_io_recall>{"key":"THE_KEY","start":1,"end":999999}</jev_io_recall>. '
+            "The shim will restore it and continue. Otherwise answer normally."
+        )
+        text_parts: list[str] = []
+        usage: dict[str, Any] = {}
+        async for event in iter_cursor_agent_events(
+            prompt, cursor_upstream_model(slug), read_only=read_only
+        ):
+            if event.get("type") == "text_delta" and isinstance(event.get("delta"), str):
+                text_parts.append(event["delta"])
+            elif event.get("type") == "completed" and not text_parts:
+                text_parts.append(str(event.get("text") or ""))
+            elif event.get("type") == "usage" and isinstance(event.get("usage"), dict):
+                usage = event["usage"]
+            elif event.get("type") == "error":
+                raise RuntimeError(str(event.get("message") or "cursor-agent failed"))
+        text = "".join(text_parts).strip()
+        if not text:
+            raise RuntimeError(f"{slug} produced no text")
+        recall_match = re.fullmatch(
+            r"\s*<jev_io_recall>\s*(\{.*\})\s*</jev_io_recall>\s*",
+            text,
+            flags=re.DOTALL,
+        )
+        if recall_match:
+            try:
+                recall_args = json.loads(recall_match.group(1))
+            except json.JSONDecodeError:
+                recall_args = {}
+            if isinstance(recall_args, dict) and recall_args.get("key"):
+                call_id = f"call_{uuid.uuid4().hex[:20]}"
+                return {
+                    "id": f"cx_{uuid.uuid4().hex[:20]}",
+                    "object": "response",
+                    "created_at": int(time.time()),
+                    "status": "completed",
+                    "model": slug,
+                    "output": [
+                        {
+                            "id": call_id,
+                            "type": "function_call",
+                            "call_id": call_id,
+                            "name": "jev_io_recall",
+                            "arguments": json.dumps(recall_args),
+                            "status": "completed",
+                        }
+                    ],
+                    "usage": usage,
+                }
+        return {
+            "id": f"cx_{uuid.uuid4().hex[:20]}",
+            "object": "response",
+            "created_at": int(time.time()),
+            "status": "completed",
+            "model": slug,
+            "output": [
+                {
+                    "id": f"msg_{uuid.uuid4().hex[:20]}",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}],
+                }
+            ],
+            "usage": usage,
+        }
+
+    async def _io_complete_candidates(
+        self,
+        body: dict[str, Any],
+        candidates: tuple[str, ...],
+        adjudicator,
+        task: str,
+    ) -> dict[str, Any]:
+        import asyncio
+
+        async def one(slug: str) -> ensemble_module.CandidateAnswer:
+            try:
+                payload = await self._io_complete_model(body, slug, read_only=True)
+                text = ensemble_module.extract_assistant_text(payload)
+                if not text:
+                    return ensemble_module.CandidateAnswer(
+                        slug=slug, text="", raw=payload, error="empty response"
+                    )
+                return ensemble_module.CandidateAnswer(slug=slug, text=text, raw=payload)
+            except Exception as exc:
+                return ensemble_module.CandidateAnswer(slug=slug, text="", error=str(exc))
+
+        answers = list(await asyncio.gather(*(one(slug) for slug in candidates)))
+        # If either candidate needs exact hidden context, satisfy recall before
+        # adjudicating potentially incomplete answers.
+        for answer in answers:
+            if answer.raw and recall_calls(answer.raw):
+                return answer.raw
+        usable = [answer for answer in answers if answer.text and not answer.error]
+        if not usable:
+            detail = "; ".join(
+                f"{answer.slug}: {answer.error or 'empty'}" for answer in answers
+            )
+            raise RuntimeError(f"IO combination produced no usable answers ({detail})")
+        winner = usable[0]
+        if adjudicator is not None and len(usable) > 1:
+            request_body = ensemble_module.build_decisions_request(
+                adjudicator, task, usable, ask_merge=False
+            )
+            label_map = request_body.pop("_label_map")
+            try:
+                decision = await self._io_decisions_post(
+                    ensemble_module.decisions_url(adjudicator),
+                    request_body,
+                    adjudicator,
+                )
+                verdict = ensemble_module.parse_adjudication(
+                    decision,
+                    label_map,
+                    usable,
+                    merge_mode="never",
+                    merge_probability=0.0,
+                )
+                winner = next(
+                    (answer for answer in usable if answer.slug == verdict.winner),
+                    usable[0],
+                )
+            except Exception:
+                pass
+        payload = dict(winner.raw or {})
+        payload["jev_io_combination"] = {
+            "winner": winner.slug,
+            "candidates": [
+                {
+                    "slug": answer.slug,
+                    "ok": not bool(answer.error),
+                    "error": answer.error,
+                }
+                for answer in answers
+            ],
+        }
+        return payload
 
     def _route(self, body: dict[str, Any]) -> ShimModel:
         requested = str(body.get("model") or "")

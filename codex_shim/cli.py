@@ -545,7 +545,9 @@ def generate(settings_path: Path, port: int) -> None:
     router_config = router_module.load_router_config(Path(settings_path).expanduser())
     ensemble_mixes = _active_ensemble_mixes(models, settings_path)
     io_config = io_profiles_module.load_io_config(settings_path, models)
-    io_profiles = io_profiles_module.active_profiles(io_config)
+    io_profiles = io_profiles_module.active_profiles(
+        io_config, available_model_slugs(models)
+    )
     write_catalog(models, CATALOG_PATH, router_config=router_config, ensemble_mixes=ensemble_mixes, io_profiles=io_profiles)
     write_config(models, CONFIG_PATH, CATALOG_PATH, port)
     print(f"Generated {len(models)} model entries:")

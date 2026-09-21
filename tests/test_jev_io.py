@@ -10,6 +10,7 @@ from codex_shim.context_store import ContextStore
 from codex_shim.io_profiles import IOProfile, active_profiles, find_profile, load_io_config
 from codex_shim.io_runtime import RECALL_TOOL_NAME, inject_recall_tool, replace_terminal_text, run_recall_loop, _rewrite_preserves_literals
 from codex_shim.retrieval import colgrep_search
+from codex_shim.server import ShimServer
 
 
 class FakeJudge:
@@ -45,7 +46,20 @@ def test_profiles_are_opt_in_and_configurable(tmp_path, monkeypatch):
     path.write_text(json.dumps({"jev_io": {"enabled": True, "profiles": [{"slug": "cs-sol-jev-io", "rollout": "shadow"}]}}))
     config = load_io_config(path)
     assert find_profile(config, "cs-sol-jev-io").rollout == "shadow"
-    assert {p.slug for p in active_profiles(config)} == {"cs-sol-jev-io", "cs-sol-jev-io-max"}
+    slugs = {p.slug for p in active_profiles(config)}
+    assert {"cs-sol-jev-io", "cs-sol-jev-io-max"} <= slugs
+    assert {
+        "cx-auto-jev-io",
+        "cx-grok-4-7-jev-io-max",
+        "cx-fable-5-1-jev-io",
+        "cx-opus-5-jev-io-max",
+        "cx-sol-5-6-high-jev-io",
+        "cx-autogrok",
+    } <= slugs
+    autogrok = find_profile(config, "cx-autogrok")
+    assert autogrok.candidates == ("cx-auto", "cx-grok-4-7")
+    assert autogrok.base_model == ""
+    assert autogrok.rollout == "active"
 
 
 def test_chunk_text_preserves_line_ranges():
@@ -119,3 +133,68 @@ def test_rewrite_literal_validation():
 async def test_colgrep_missing_is_graceful(monkeypatch, tmp_path):
     monkeypatch.setattr("codex_shim.retrieval.shutil.which", lambda _name: None)
     assert await colgrep_search("thing", (str(tmp_path),)) == []
+
+
+@pytest.mark.asyncio
+async def test_cursor_io_text_recall_protocol_becomes_internal_call(monkeypatch, tmp_path):
+    settings = tmp_path / "models.json"
+    settings.write_text("{}")
+    server = ShimServer(settings)
+
+    async def events(_prompt, model, *, read_only=False):
+        assert model == "grok-4.7-high"
+        assert read_only is False
+        yield {
+            "type": "text_delta",
+            "delta": '<jev_io_recall>{"key":"abc","start":2,"end":4}</jev_io_recall>',
+        }
+
+    monkeypatch.setattr("codex_shim.server.iter_cursor_agent_events", events)
+    payload = await server._io_cursor_json(
+        {"input": [{"role": "user", "content": "continue"}]},
+        "cx-grok-4-7",
+    )
+    call = payload["output"][0]
+    assert call["type"] == "function_call"
+    assert call["name"] == RECALL_TOOL_NAME
+    assert json.loads(call["arguments"]) == {"key": "abc", "start": 2, "end": 4}
+
+
+@pytest.mark.asyncio
+async def test_autogrok_returns_recall_before_adjudication(monkeypatch, tmp_path):
+    settings = tmp_path / "models.json"
+    settings.write_text("{}")
+    server = ShimServer(settings)
+    recalled = {
+        "output": [
+            {
+                "type": "function_call",
+                "id": "call_1",
+                "call_id": "call_1",
+                "name": RECALL_TOOL_NAME,
+                "arguments": '{"key":"abc"}',
+            }
+        ]
+    }
+
+    async def complete(_body, slug, *, read_only=False):
+        assert read_only is True
+        if slug == "cx-auto":
+            return recalled
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "answer"}],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(server, "_io_complete_model", complete)
+    payload = await server._io_complete_candidates(
+        {"input": []},
+        ("cx-auto", "cx-grok-4-7"),
+        None,
+        "task",
+    )
+    assert payload is recalled

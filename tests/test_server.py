@@ -611,6 +611,8 @@ def cursor_missing(monkeypatch):
 
 
 async def test_health_and_models_include_cursor_passthrough_when_auth_present(tmp_path, cursor_present, auth_missing):
+    from codex_shim.cursor_passthrough import cursor_passthrough_display_names
+
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"customModels": []}))
     shim_client = TestClient(TestServer(ShimServer(settings).app()))
@@ -619,12 +621,13 @@ async def test_health_and_models_include_cursor_passthrough_when_auth_present(tm
     health = await shim_client.get("/health")
     assert health.status == 200
     body = await health.json()
-    assert body["models"] == 1
+    expected = sorted(cursor_passthrough_display_names())
+    assert body["models"] == len(expected)
     assert body["cursor_passthrough"] is True
 
     models = await shim_client.get("/v1/models")
     payload = await models.json()
-    assert [model["id"] for model in payload["data"]] == ["composer-2-5"]
+    assert [model["id"] for model in payload["data"]] == expected
 
     await shim_client.close()
 

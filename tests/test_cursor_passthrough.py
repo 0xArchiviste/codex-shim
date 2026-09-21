@@ -5,6 +5,8 @@ import json
 from codex_shim.cursor_passthrough import (
     CursorStreamParser,
     build_cursor_prompt,
+    cursor_passthrough_display_names,
+    cursor_upstream_model,
     is_cursor_passthrough_slug,
     iter_cursor_agent_events,
 )
@@ -14,6 +16,24 @@ def test_is_cursor_passthrough_slug():
     assert is_cursor_passthrough_slug("composer-2-5")
     assert is_cursor_passthrough_slug("composer-2.5")
     assert not is_cursor_passthrough_slug("gpt-5.5")
+
+
+def test_cursor_subscription_aliases_resolve_expected_models():
+    expected = {
+        "cx-auto": "auto",
+        "cx-grok-4-7": "grok-4.7-high",
+        "cx-fable-5-1": "claude-fable-5-1-medium",
+        "cx-fable-5-1-high": "claude-fable-5-1-high",
+        "cx-fable-5": "claude-fable-5-medium",
+        "cx-fable-5-high": "claude-fable-5-high",
+        "cx-opus-5": "claude-opus-5-thinking-high",
+        "cx-sol-5-6": "gpt-5.6-sol-medium",
+        "cx-sol-5-6-high": "gpt-5.6-sol-high",
+    }
+    assert expected.keys() <= cursor_passthrough_display_names().keys()
+    for alias, upstream in expected.items():
+        assert is_cursor_passthrough_slug(alias)
+        assert cursor_upstream_model(alias) == upstream
 
 
 def test_build_cursor_prompt_from_responses_body():

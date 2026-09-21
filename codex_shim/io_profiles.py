@@ -13,6 +13,21 @@ IO_PROFILE_SLUG = "cs-sol-jev-io"
 IO_MAX_PROFILE_SLUG = "cs-sol-jev-io-max"
 VALID_ROLLOUTS = frozenset({"off", "shadow", "active"})
 
+# (public base alias, display name). Each receives ``-jev-io`` and
+# ``-jev-io-max`` profiles. The aliases themselves are defined by their
+# transport modules; this table only layers IO behavior over them.
+CURSOR_IO_BASES: tuple[tuple[str, str], ...] = (
+    ("cx-auto", "Cursor Auto"),
+    ("cx-grok-4-7", "Cursor Grok 4.7 High"),
+    ("cx-fable-5-1", "Cursor Fable 5.1 Medium"),
+    ("cx-fable-5-1-high", "Cursor Fable 5.1 High"),
+    ("cx-fable-5", "Cursor Fable 5 Medium"),
+    ("cx-fable-5-high", "Cursor Fable 5 High"),
+    ("cx-opus-5", "Cursor Opus 5 High Thinking"),
+    ("cx-sol-5-6", "Cursor GPT-5.6 Sol Medium"),
+    ("cx-sol-5-6-high", "Cursor GPT-5.6 Sol High"),
+)
+
 
 @dataclass(frozen=True)
 class RewriteConfig:
@@ -40,6 +55,7 @@ class IOProfile:
     max_internal_rounds: int = 3
     retrieval_roots: tuple[str, ...] = ()
     retrieval_results: int = 8
+    candidates: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -110,13 +126,73 @@ def load_io_config(settings_path: Path | str, byok_models: list[Any] | None = No
     defaults = raw.get("defaults") if isinstance(raw.get("defaults"), dict) else {}
     rows = raw.get("profiles") if isinstance(raw.get("profiles"), list) else []
     configured = {str(row.get("slug") or ""): row for row in rows if isinstance(row, dict)}
-    profiles = (
-        _parse_profile(IO_PROFILE_SLUG, "Codex Sol Jev IO", False, configured.get(IO_PROFILE_SLUG), defaults),
-        _parse_profile(IO_MAX_PROFILE_SLUG, "Codex Sol Jev IO Max", True, configured.get(IO_MAX_PROFILE_SLUG), defaults),
+    specs: list[tuple[str, str, str, bool, tuple[str, ...], str]] = [
+        (IO_PROFILE_SLUG, "Codex Sol Jev IO", "cs-sol-medium", False, (), "shadow"),
+        (IO_MAX_PROFILE_SLUG, "Codex Sol Jev IO Max", "cs-sol-medium", True, (), "shadow"),
+    ]
+    for base_slug, display_name in CURSOR_IO_BASES:
+        specs.extend(
+            (
+                (
+                    f"{base_slug}-jev-io",
+                    f"{display_name} Jev IO",
+                    base_slug,
+                    False,
+                    (),
+                    "shadow",
+                ),
+                (
+                    f"{base_slug}-jev-io-max",
+                    f"{display_name} Jev IO Max",
+                    base_slug,
+                    True,
+                    (),
+                    "shadow",
+                ),
+            )
+        )
+    specs.append(
+        (
+            "cx-autogrok",
+            "Cursor Auto × Grok 4.7 (Jev IO)",
+            "",
+            False,
+            ("cx-auto", "cx-grok-4-7"),
+            "active",
+        )
     )
+    profiles = [
+        _parse_profile(
+            slug,
+            display,
+            base_model,
+            maximum,
+            configured.get(slug),
+            defaults,
+            candidates,
+            default_rollout,
+        )
+        for slug, display, base_model, maximum, candidates, default_rollout in specs
+    ]
+    # Permit additional explicit profiles without requiring a code change.
+    known = {profile.slug for profile in profiles}
+    for slug, row in configured.items():
+        if slug and slug not in known:
+            profiles.append(
+                _parse_profile(
+                    slug,
+                    str(row.get("display_name") or slug),
+                    str(row.get("base_model") or ""),
+                    bool(row.get("rewrite_input") or row.get("rewrite_output")),
+                    row,
+                    defaults,
+                    (),
+                    "shadow",
+                )
+            )
     # Profiles are opt-in: an absent ``jev_io`` block must not change discovery
     # or model counts in existing installations.
-    return IOConfig(bool(raw.get("enabled", bool(raw))), adjudicator, rewriter, profiles)
+    return IOConfig(bool(raw.get("enabled", bool(raw))), adjudicator, rewriter, tuple(profiles))
 
 
 def find_profile(config: IOConfig, slug: str) -> IOProfile | None:
@@ -125,8 +201,24 @@ def find_profile(config: IOConfig, slug: str) -> IOProfile | None:
     return next((p for p in config.profiles if p.slug == slug and p.rollout != "off"), None)
 
 
-def active_profiles(config: IOConfig) -> list[IOProfile]:
-    return [p for p in config.profiles if config.effective_enabled and p.rollout != "off"]
+def active_profiles(
+    config: IOConfig, available: set[str] | None = None
+) -> list[IOProfile]:
+    profiles = [
+        p for p in config.profiles if config.effective_enabled and p.rollout != "off"
+    ]
+    if available is None:
+        return profiles
+    return [
+        profile
+        for profile in profiles
+        if (
+            profile.base_model in available
+            if profile.base_model
+            else bool(profile.candidates)
+            and all(candidate in available for candidate in profile.candidates)
+        )
+    ]
 
 
 def models_entry(profile: IOProfile, created: int) -> dict[str, Any]:
@@ -134,13 +226,17 @@ def models_entry(profile: IOProfile, created: int) -> dict[str, Any]:
 
 
 def catalog_entry(profile: IOProfile) -> dict[str, Any]:
+    context_window = 1_000_000 if profile.slug.startswith("cx-") else 400_000
     return {
         "slug": profile.slug,
         "display_name": profile.display_name,
-        "description": f"Codex Sol Medium with reversible Jev IO processing ({profile.rollout}).",
-        "context_window": 400_000,
-        "max_context_window": 400_000,
-        "auto_compact_token_limit": 320_000,
+        "description": (
+            f"{profile.display_name} with reversible Jev IO processing "
+            f"({profile.rollout})."
+        ),
+        "context_window": context_window,
+        "max_context_window": context_window,
+        "auto_compact_token_limit": int(context_window * 0.8),
         "truncation_policy": {"mode": "tokens", "limit": 64_000},
         "default_reasoning_level": "medium",
         "supported_reasoning_levels": [{"effort": x, "description": x} for x in ("low", "medium", "high", "xhigh")],
@@ -152,20 +248,38 @@ def catalog_entry(profile: IOProfile) -> dict[str, Any]:
     }
 
 
-def _parse_profile(slug: str, display: str, maximum: bool, row: Any, defaults: dict[str, Any]) -> IOProfile:
+def _parse_profile(
+    slug: str,
+    display: str,
+    base_model: str,
+    maximum: bool,
+    row: Any,
+    defaults: dict[str, Any],
+    candidates: tuple[str, ...],
+    default_rollout: str,
+) -> IOProfile:
     values = dict(defaults)
     if isinstance(row, dict):
         values.update(row)
-    rollout = str(values.get("rollout") or os.environ.get("CODEX_SHIM_JEV_IO_ROLLOUT") or "shadow").lower()
+    rollout = str(
+        values.get("rollout")
+        or os.environ.get("CODEX_SHIM_JEV_IO_ROLLOUT")
+        or default_rollout
+    ).lower()
     if rollout not in VALID_ROLLOUTS:
         rollout = "off"
     roots = values.get("retrieval_roots") or values.get("retrievalRoots") or []
     if isinstance(roots, str):
         roots = [roots]
+    raw_candidates = values.get("candidates", candidates)
+    if isinstance(raw_candidates, str):
+        raw_candidates = [x.strip() for x in raw_candidates.split(",") if x.strip()]
+    if not isinstance(raw_candidates, (list, tuple)):
+        raw_candidates = candidates
     return IOProfile(
         slug=slug,
         display_name=str(values.get("display_name") or display),
-        base_model=str(values.get("base_model") or "cs-sol-medium"),
+        base_model=str(values.get("base_model") or base_model),
         rollout=rollout,
         rewrite_input=bool(values.get("rewrite_input", maximum)),
         rewrite_output=bool(values.get("rewrite_output", maximum)),
@@ -178,6 +292,7 @@ def _parse_profile(slug: str, display: str, maximum: bool, row: Any, defaults: d
         max_internal_rounds=_integer(values.get("max_internal_rounds"), 3),
         retrieval_roots=tuple(str(Path(x).expanduser()) for x in roots if str(x).strip()),
         retrieval_results=_integer(values.get("retrieval_results"), 8),
+        candidates=tuple(str(x) for x in raw_candidates if str(x).strip()),
     )
 
 

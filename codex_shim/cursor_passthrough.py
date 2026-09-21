@@ -14,7 +14,26 @@ from .translate import responses_to_chat, strip_think
 CURSOR_MODEL_SLUG = "composer-2-5"
 CURSOR_UPSTREAM_MODEL = "composer-2.5"
 CURSOR_DISPLAY_NAME = "Composer 2.5"
-CURSOR_PASSTHROUGH_SLUGS = frozenset({CURSOR_MODEL_SLUG, "composer-2.5"})
+
+# Stable shim aliases for selected Cursor subscription models. Upstream model
+# IDs are deliberately kept in one table so Cursor catalog changes do not leak
+# into the public API. The short family alias is the balanced default; explicit
+# ``-high`` aliases are provided where requested.
+CURSOR_MODEL_ALIASES: dict[str, tuple[str, str]] = {
+    CURSOR_MODEL_SLUG: (CURSOR_UPSTREAM_MODEL, CURSOR_DISPLAY_NAME),
+    "cx-auto": ("auto", "Cursor Auto"),
+    "cx-grok-4-7": ("grok-4.7-high", "Cursor Grok 4.7 High"),
+    "cx-fable-5-1": ("claude-fable-5-1-medium", "Cursor Fable 5.1 Medium"),
+    "cx-fable-5-1-high": ("claude-fable-5-1-high", "Cursor Fable 5.1 High"),
+    "cx-fable-5": ("claude-fable-5-medium", "Cursor Fable 5 Medium"),
+    "cx-fable-5-high": ("claude-fable-5-high", "Cursor Fable 5 High"),
+    "cx-opus-5": ("claude-opus-5-thinking-high", "Cursor Opus 5 High Thinking"),
+    "cx-sol-5-6": ("gpt-5.6-sol-medium", "Cursor GPT-5.6 Sol Medium"),
+    "cx-sol-5-6-high": ("gpt-5.6-sol-high", "Cursor GPT-5.6 Sol High"),
+}
+CURSOR_PASSTHROUGH_SLUGS = frozenset(
+    {*CURSOR_MODEL_ALIASES, *(upstream for upstream, _ in CURSOR_MODEL_ALIASES.values()), "composer-2.5"}
+)
 _AUTH_PROBE_TTL_SEC = 30.0
 _auth_probe_cache: tuple[float, bool] | None = None
 
@@ -96,7 +115,12 @@ def is_cursor_passthrough_slug(slug: str) -> bool:
     return slug in CURSOR_PASSTHROUGH_SLUGS
 
 
-def cursor_upstream_model(_slug: str) -> str:
+def cursor_upstream_model(slug: str) -> str:
+    row = CURSOR_MODEL_ALIASES.get(slug)
+    if row is not None:
+        return row[0]
+    if slug in {upstream for upstream, _ in CURSOR_MODEL_ALIASES.values()}:
+        return slug
     return CURSOR_UPSTREAM_MODEL
 
 
@@ -106,17 +130,24 @@ def cursor_workspace() -> str:
 
 
 def cursor_passthrough_display_names() -> dict[str, str]:
-    return {CURSOR_MODEL_SLUG: CURSOR_DISPLAY_NAME}
+    return {slug: display for slug, (_, display) in CURSOR_MODEL_ALIASES.items()}
 
 
-def cursor_catalog_entry() -> dict[str, Any]:
+def cursor_catalog_entry(slug: str = CURSOR_MODEL_SLUG) -> dict[str, Any]:
+    upstream, display_name = CURSOR_MODEL_ALIASES.get(
+        slug, (cursor_upstream_model(slug), slug)
+    )
+    context_window = 272_000 if slug == CURSOR_MODEL_SLUG else 1_000_000
     return {
-        "slug": CURSOR_MODEL_SLUG,
-        "display_name": CURSOR_DISPLAY_NAME,
-        "description": "Cursor Composer 2.5 routed through your Cursor subscription (cursor-agent login).",
-        "context_window": 272_000,
-        "max_context_window": 272_000,
-        "auto_compact_token_limit": 217_600,
+        "slug": slug,
+        "display_name": display_name,
+        "description": (
+            f"{display_name} ({upstream}) routed through your Cursor subscription "
+            "(cursor-agent login)."
+        ),
+        "context_window": context_window,
+        "max_context_window": context_window,
+        "auto_compact_token_limit": int(context_window * 0.8),
         "truncation_policy": {"mode": "tokens", "limit": 64_000},
         "default_reasoning_level": "medium",
         "supported_reasoning_levels": [
@@ -142,13 +173,13 @@ def cursor_catalog_entry() -> dict[str, Any]:
         "supported_in_api": True,
         "availability_nux": None,
         "upgrade": None,
-        "priority": 11000,
+        "priority": 11000 if slug == CURSOR_MODEL_SLUG else 10500,
         "prefer_websockets": False,
         "available_in_plans": ["free", "plus", "pro", "team", "business", "enterprise"],
-        "base_instructions": "You are Codex, a coding agent powered by Composer 2.5.",
+        "base_instructions": f"You are Codex, a coding agent powered by {display_name}.",
         "model_messages": {
-            "instructions_template": "You are Codex, a coding agent powered by Composer 2.5.",
-            "instructions_variables": {"model_name": CURSOR_DISPLAY_NAME},
+            "instructions_template": f"You are Codex, a coding agent powered by {display_name}.",
+            "instructions_variables": {"model_name": display_name},
         },
     }
 
@@ -276,7 +307,9 @@ class CursorStreamParser:
         return text
 
 
-async def iter_cursor_agent_events(prompt: str, model: str) -> AsyncIterator[dict[str, Any]]:
+async def iter_cursor_agent_events(
+    prompt: str, model: str, *, read_only: bool = False
+) -> AsyncIterator[dict[str, Any]]:
     """Spawn cursor-agent and yield normalized stream events."""
     cmd = [
         _cursor_agent_bin(),
@@ -291,6 +324,8 @@ async def iter_cursor_agent_events(prompt: str, model: str) -> AsyncIterator[dic
         "--model",
         model,
     ]
+    if read_only:
+        cmd.extend(["--mode", "ask"])
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdin=asyncio.subprocess.PIPE,

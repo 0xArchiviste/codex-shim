@@ -6,8 +6,9 @@ API keys in `~/.codex-shim/models.json`:
 - **ChatGPT/Codex passthrough** uses the Codex access token created by
   `codex login` and forwards native `/v1/responses` requests to ChatGPT's Codex
   backend.
-- **Cursor/Composer passthrough** uses the local `cursor-agent` OAuth session
-  created by `cursor-agent login` and exposes Composer 2.5 as `composer-2-5`.
+- **Cursor model passthrough** uses the local `cursor-agent` OAuth session
+  created by `cursor-agent login` and exposes selected models with stable
+  `cx-*` aliases.
 
 Both integrations are optional, auth-gated, and advertised only when the local
 login state is usable. They are different from BYOK routes: you do not add a
@@ -101,20 +102,35 @@ to stop listing ChatGPT passthrough entries immediately.
 
 ---
 
-## Cursor/Composer passthrough
+## Cursor model passthrough
 
 ### What it does
 
-When `cursor-agent status` reports an active login, the shim exposes Composer
-2.5 as:
+When `cursor-agent status` reports an active login, the shim exposes:
 
 ```text
 composer-2-5
+cx-auto
+cx-grok-4-7
+cx-fable-5-1
+cx-fable-5-1-high
+cx-fable-5
+cx-fable-5-high
+cx-opus-5
+cx-sol-5-6
+cx-sol-5-6-high
 ```
 
 Requests to that slug are converted into a prompt for `cursor-agent --print`
 using your local CLI OAuth session. This is subscription passthrough, not
 Dashboard API-key billing.
+
+Every `cx-*` alias also has `-jev-io` and `-jev-io-max` profiles when the
+top-level `jev_io` configuration is enabled. `cx-autogrok` is a combination
+profile that applies active Jev IO to the shared input, runs `cx-auto` and
+`cx-grok-4-7` concurrently in read-only `ask` mode, then asks Jev to select the
+result. The read-only constraint prevents competing agents from mutating the
+same workspace.
 
 ### Setup
 
@@ -125,10 +141,10 @@ codex-shim generate
 codex-shim list
 ```
 
-Then select `Composer 2.5` in the picker or run:
+Then select a Cursor model in the picker or run:
 
 ```bash
-codex-shim model use composer-2-5
+codex-shim model use cx-auto
 ```
 
 The helper script is optional, but convenient:
@@ -212,7 +228,7 @@ so a stale shell variable cannot override your CLI OAuth login.
 | Flow | Credential source | Slug examples | Upstream shape |
 |---|---|---|---|
 | ChatGPT/Codex passthrough | `codex login` / `~/.codex/auth.json` | `gpt-5.5` | Native Codex Responses backend |
-| Cursor/Composer passthrough | `cursor-agent login` | `composer-2-5` | `cursor-agent --print` bridge |
+| Cursor model passthrough | `cursor-agent login` | `cx-auto`, `cx-fable-5-1`, `cx-grok-4-7` | `cursor-agent --print` bridge |
 | BYOK OpenAI-compatible | `api_key` or `api_key_env` in settings | your configured slug | `/chat/completions` |
 | BYOK Anthropic-compatible | `api_key` or `api_key_env` in settings | your configured slug | `/messages` |
 

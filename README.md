@@ -640,10 +640,28 @@ GLM, etc.) round-trip through `reasoning.encrypted_content` items.
 ## Jev IO context profiles
 
 Jev IO is an opt-in, reversible context layer for large Read/Bash/Grep results.
-It exposes `cs-sol-jev-io` and `cs-sol-jev-io-max`, both backed by
-`cs-sol-medium`. The max profile additionally enables conservative prompt and
-terminal-prose refinement when a generative rewriter is configured. Internal
-recall is buffered, so its tool calls are never sent to the client.
+It exposes `-jev-io` and `-jev-io-max` variants for ChatGPT-backed Sol and the
+selected `cx-*` Cursor subscription aliases below. The max profile additionally
+enables conservative prompt and terminal-prose refinement when a generative
+rewriter is configured. Internal recall is buffered, so its tool calls are
+never sent to the client.
+
+Cursor aliases use the local `cursor-agent` OAuth session:
+
+- `cx-auto` → Cursor Auto
+- `cx-grok-4-7` → Grok 4.7 High
+- `cx-fable-5-1` / `cx-fable-5-1-high`
+- `cx-fable-5` / `cx-fable-5-high`
+- `cx-opus-5` → Opus 5 High Thinking
+- `cx-sol-5-6` / `cx-sol-5-6-high`
+
+For example, Fable 5.1 exposes `cx-fable-5-1`,
+`cx-fable-5-1-jev-io`, and `cx-fable-5-1-jev-io-max`.
+`cx-autogrok` is an active-Jev-IO combination: it trims the shared input, runs
+Cursor Auto and Grok 4.7 High concurrently in Cursor's read-only `ask` mode,
+and uses Jev to select the answer. Read-only probes prevent two agents from
+racing edits in the same workspace. If either candidate requests exact hidden
+context, recall is satisfied before the candidates are adjudicated.
 
 Add a top-level block to `~/.codex-shim/models.json` and regenerate the catalog:
 
