@@ -16,6 +16,27 @@ python3 -m compileall codex_shim/ -q
 CI runs the same commands on Python 3.11 and 3.12 via
 `.github/workflows/ci.yml`. Match it locally before opening a PR.
 
+## Agent deployment directive
+
+When a task changes runtime behavior and asks to update the live reverse-BYOK
+shim, agents should preserve the current endpoint and credentials:
+
+1. Read the live process command line, working directory, PID file, configured
+   settings path, and listening port before acting.
+2. Regenerate and gracefully restart the daemon on that same port with
+   `codex-shim --settings <existing-settings> --port <existing-port> restart`.
+   Repair a stale/missing PID file only after verifying the actual listener PID.
+3. Do not restart ngrok when it already forwards to that port; this preserves
+   its public URL. Do not rotate `CODEX_SHIM_API_KEY`.
+4. Verify local `/health`, authenticated local `/v1/models`, the ngrok target,
+   and authenticated public `/v1/models` after the handoff.
+5. Run tests and `git diff --check` before committing repository changes. Never
+   commit files under `~/.codex-shim`, API keys, tunnel credentials, or runtime
+   PID/log files.
+
+The current reverse-BYOK convention uses port `8766`, but always inspect the
+running deployment instead of assuming it.
+
 ## What kinds of changes are useful
 
 - Translation fixes for tricky tool-call / reasoning streams, with a

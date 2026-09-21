@@ -659,20 +659,36 @@ Add a top-level block to `~/.codex-shim/models.json` and regenerate the catalog:
     "model": "openai/gpt-5-mini"
   },
   "defaults": {
-    "rollout": "shadow",
+    "rollout": "active",
     "retrieval_roots": ["/absolute/path/to/workspace"]
   }
 }
 ```
 
-`shadow` calls the judge and records recoverable artifacts without changing
-model-visible content. Change a profile to `"rollout": "active"` only after
-replay/labeling on your workload. Filtering fails open when Jev, storage, scope,
-or optional ColGREP retrieval is unavailable. Exact hiding requires a stable
+`active` replaces confidently irrelevant spans with exact-recall stubs. Use
+`"rollout": "shadow"` to collect decisions and artifacts without changing
+model-visible content, or `"off"` to disable a profile. Filtering fails open
+when Jev, storage, scope, or optional ColGREP retrieval is unavailable. Exact
+hiding requires a stable
 `session_id` request header; unscoped requests remain unchanged. ColGREP is
 never installed automatically and is skipped when its binary/index is absent.
 The rewriter is optional; without it the max profile behaves like ordinary IO
 for prompt/answer rewriting.
+
+After changing Jev IO config or pulling shim code, regenerate and gracefully
+restart the existing daemon on its current port rather than starting a second
+process. For the reverse-BYOK/ngrok deployment in this repository:
+
+```bash
+codex-shim --settings ~/.codex-shim/models.json --port 8766 restart
+codex-shim --settings ~/.codex-shim/models.json --port 8766 status
+```
+
+The CLI daemon environment merges `~/.codex-shim/reverse-byok.env`, preserving
+the existing shim API key and ngrok host allowlist. Leave the ngrok process
+running: it continues forwarding the same public URL to the replacement daemon.
+Verify `/health` locally and authenticated `/v1/models` through the public URL;
+the selected Jev IO slugs should appear on both surfaces.
 
 ---
 
