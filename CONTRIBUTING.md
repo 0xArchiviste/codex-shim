@@ -22,10 +22,13 @@ When a task changes runtime behavior and asks to update the live reverse-BYOK
 shim, agents should preserve the current endpoint and credentials:
 
 1. Read the live process command line, working directory, PID file, configured
-   settings path, and listening port before acting.
+   settings path, listening port, and service manager ownership before acting.
+   Check `systemctl --user status codex-shim.service` on Linux.
 2. Regenerate and gracefully restart the daemon on that same port with
    `codex-shim --settings <existing-settings> --port <existing-port> restart`.
-   Repair a stale/missing PID file only after verifying the actual listener PID.
+   The CLI delegates to an active `codex-shim.service`; never stop/start a
+   second process against a `Restart=always` unit. Repair a stale/missing PID
+   file only after verifying the actual listener or service `MainPID`.
 3. Do not restart ngrok when it already forwards to that port; this preserves
    its public URL. Do not rotate `CODEX_SHIM_API_KEY`.
 4. Verify local `/health`, authenticated local `/v1/models`, the ngrok target,

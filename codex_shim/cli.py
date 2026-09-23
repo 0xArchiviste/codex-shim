@@ -151,6 +151,9 @@ def main(argv: list[str] | None = None) -> int:
             restore_codex_config()
         return stop()
     if args.command == "restart":
+        if _managed_user_service_active():
+            generate(args.settings, args.port)
+            return _restart_managed_user_service(args.port)
         stop()
         generate(args.settings, args.port)
         return start(args.settings, args.port)
@@ -726,6 +729,67 @@ def status(port: int) -> int:
         print(f"Shim process {pid} exists but health check failed.")
         return 1
     print("Shim is stopped.")
+    return 1
+
+
+def _managed_user_service_active() -> bool:
+    """Whether systemd owns the live shim process.
+
+    Starting a second daemon while an enabled Restart=always service owns the
+    port races systemd and leaves a stale PID file. Prefer restarting the
+    service in place when it is active.
+    """
+    if os.name == "nt" or shutil.which("systemctl") is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", "codex-shim.service"],
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def _restart_managed_user_service(port: int) -> int:
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "restart", "codex-shim.service"],
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"Managed shim restart failed: {exc}", file=sys.stderr)
+        return 1
+    if result.returncode:
+        print("Managed shim restart failed; inspect systemctl --user status codex-shim.service.", file=sys.stderr)
+        return result.returncode
+    for _ in range(50):
+        if _healthy(port):
+            pid_result = subprocess.run(
+                [
+                    "systemctl",
+                    "--user",
+                    "show",
+                    "codex-shim.service",
+                    "-p",
+                    "MainPID",
+                    "--value",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            pid = pid_result.stdout.strip()
+            if pid.isdigit() and int(pid) > 0:
+                RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+                PID_PATH.write_text(pid)
+            print(f"Managed shim restarted on http://{DEFAULT_HOST}:{port} with pid {pid or 'unknown'}.")
+            return 0
+        time.sleep(0.1)
+    print("Managed shim restarted but health check timed out.", file=sys.stderr)
     return 1
 
 

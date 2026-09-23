@@ -711,6 +711,9 @@ codex-shim --settings ~/.codex-shim/models.json --port 8766 status
 The CLI daemon environment merges `~/.codex-shim/reverse-byok.env`, preserving
 the existing shim API key and ngrok host allowlist. Leave the ngrok process
 running: it continues forwarding the same public URL to the replacement daemon.
+When `codex-shim.service` is active, `codex-shim restart` delegates the restart
+to systemd and refreshes the local PID file instead of racing a second daemon
+against the service's `Restart=always` policy.
 Verify `/health` locally and authenticated `/v1/models` through the public URL;
 the selected Jev IO slugs should appear on both surfaces.
 

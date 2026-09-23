@@ -272,3 +272,23 @@ def test_codex_config_uninstalled_is_info(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 0
     assert "shim provider is not currently installed" in out
+
+
+def test_restart_uses_active_systemd_service(monkeypatch, tmp_path):
+    settings = _settings(tmp_path / "models.json", [])
+    calls = []
+    monkeypatch.setattr(cli, "_managed_user_service_active", lambda: True)
+    monkeypatch.setattr(
+        cli, "generate", lambda settings_path, port: calls.append(("generate", settings_path, port))
+    )
+    monkeypatch.setattr(
+        cli, "_restart_managed_user_service", lambda port: calls.append(("restart", port)) or 0
+    )
+    monkeypatch.setattr(
+        cli, "stop", lambda: (_ for _ in ()).throw(AssertionError("must not stop directly"))
+    )
+
+    code = cli.main(["--settings", str(settings), "--port", "8766", "restart"])
+
+    assert code == 0
+    assert calls == [("generate", settings, 8766), ("restart", 8766)]
