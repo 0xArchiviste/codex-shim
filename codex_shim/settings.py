@@ -30,6 +30,8 @@ FALLBACK_CHATGPT_PASSTHROUGH_SLUGS = (
     "gpt-5.6-luna",
     "gpt-5.6-terra",
     "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-reserve",
 )
 FALLBACK_CHATGPT_DISPLAY_NAMES = {
@@ -44,6 +46,8 @@ FALLBACK_CHATGPT_DISPLAY_NAMES = {
     "gpt-5.6-luna": "GPT-5.6-Luna",
     "gpt-5.6-terra": "GPT-5.6-Terra",
     "gpt-6-astra": "GPT-6-Astra",
+    "gpt-6-sol": "GPT-6-Sol",
+    "gpt-6-luna": "GPT-6-Luna",
     "gpt-reserve": "GPT Reserve",
 }
 
@@ -60,6 +64,8 @@ CHATGPT_MODEL_ALIASES: dict[str, tuple[str, str | None]] = {
     "cs-astra-low": ("gpt-6-astra", "low"),
     "cs-astra-medium": ("gpt-6-astra", "medium"),
     "cs-astra-high": ("gpt-6-astra", "high"),
+    "cs-sol-6-medium": ("gpt-6-sol", "medium"),
+    "cs-luna-6-medium": ("gpt-6-luna", "medium"),
     "cs-sol": ("gpt-5.6-sol", None),
     "cs-sol-light": ("gpt-5.6-sol", "low"),
     "cs-sol-medium": ("gpt-5.6-sol", "medium"),
@@ -71,6 +77,8 @@ CHATGPT_MODEL_ALIASES: dict[str, tuple[str, str | None]] = {
     "gpt-6-astra-medium": ("gpt-6-astra", "medium"),
     "gpt-6-astra-med": ("gpt-6-astra", "medium"),
     "gpt-6-astra-high": ("gpt-6-astra", "high"),
+    "gpt-6-sol-medium": ("gpt-6-sol", "medium"),
+    "gpt-6-luna-medium": ("gpt-6-luna", "medium"),
 }
 
 
@@ -236,6 +244,8 @@ def chatgpt_passthrough_display_names(cache_path: Path | None = None) -> dict[st
             "cs-sol": "Codex Sol",
             "cs-sol-light": "Codex Sol Light",
             "cs-sol-medium": "Codex Sol Medium",
+            "cs-sol-6-medium": "Codex GPT-6 Sol Medium",
+            "cs-luna-6-medium": "Codex GPT-6 Luna Medium",
             "gpt-5.6-sol-medium": "GPT-5.6-Sol Medium",
             "gpt-5.6-sol-light": "GPT-5.6-Sol Light",
             "gpt-6-astra-light": "GPT-6-Astra Light",
@@ -243,6 +253,8 @@ def chatgpt_passthrough_display_names(cache_path: Path | None = None) -> dict[st
             "gpt-6-astra-medium": "GPT-6-Astra Medium",
             "gpt-6-astra-med": "GPT-6-Astra Medium",
             "gpt-6-astra-high": "GPT-6-Astra High",
+            "gpt-6-sol-medium": "GPT-6-Sol Medium",
+            "gpt-6-luna-medium": "GPT-6-Luna Medium",
         }
     )
     return names

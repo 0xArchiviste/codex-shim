@@ -557,13 +557,13 @@ and re-check the manual patch needles against the installed Desktop build.
 ## ChatGPT/Codex passthrough
 
 If `~/.codex/auth.json` exists and contains `tokens.access_token`, the shim
-exposes a synthetic `gpt-5.5` catalog entry that proxies straight to:
+exposes Codex subscription models that proxy straight to:
 
 ```text
 https://chatgpt.com/backend-api/codex/responses
 ```
 
-The entry is **only** advertised in `/health`, `/v1/models`, `codex-shim list`,
+The entries are **only** advertised in `/health`, `/v1/models`, `codex-shim list`,
 and the generated `custom_model_catalog.json` while that token is present. Once
 you `codex logout` or the file is missing, the slug stops appearing — so the
 picker never shows an option that would 401 on first use. Run `codex login` to
@@ -575,12 +575,18 @@ model to `gpt-5.5`, and sends your Codex access token as `Authorization: Bearer
 <access_token>` with the ChatGPT account id from `auth.json` when present. It
 bypasses configured BYOK routes entirely and uses your ChatGPT subscription quota.
 
-It is already in `.codex-shim/custom_model_catalog.json` after `codex-shim
-generate`. Select `GPT-5.5` in the picker, or run:
+They are included in `.codex-shim/custom_model_catalog.json` after
+`codex-shim generate`. Opaque aliases avoid collisions with consuming clients'
+built-in model registries. Current GPT-6 medium aliases include:
 
 ```bash
-codex-model gpt-5.5
+codex-model cs-sol-6-medium
+codex-model cs-luna-6-medium
 ```
+
+These map to `gpt-6-sol` and `gpt-6-luna` respectively and force medium
+reasoning. The explicit aliases `gpt-6-sol-medium` and
+`gpt-6-luna-medium` are also accepted.
 
 Older local configs or notes may refer to `openai-gpt-5-5`; the server accepts
 that prefix as an alias and routes it to the same passthrough.
