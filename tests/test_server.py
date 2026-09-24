@@ -41,6 +41,82 @@ def auth_missing(monkeypatch, tmp_path):
     monkeypatch.setattr("codex_shim.server.DEFAULT_CODEX_AUTH", missing)
 
 
+@pytest.mark.parametrize("wire", ["chat", "responses"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_chatgpt_cache_controls_and_usage(monkeypatch, tmp_path, auth_present, wire, stream):
+    """Exercise real HTTP handlers but replace every paid upstream call."""
+    captured = []
+    usage = {
+        "input_tokens": 2048, "output_tokens": 10, "total_tokens": 2058,
+        "input_tokens_details": {"cached_tokens": 1536},
+        "output_tokens_details": {"reasoning_tokens": 4},
+    }
+    completed = {
+        "id": "resp_cached", "object": "response", "model": "gpt-5.5",
+        "status": "completed", "output": [], "usage": usage,
+    }
+
+    class FakeStream:
+        async def iter_chunked(self, _size):
+            yield ("data: " + json.dumps({"type": "response.completed", "response": completed}) + "\n\n").encode()
+            yield b"data: [DONE]\n\n"
+
+    class FakeUpstream:
+        status = 200
+        content = FakeStream()
+
+        def release(self):
+            pass
+
+    async def fake_post(self, url, json=None, headers=None):
+        assert url == "https://chatgpt.com/backend-api/codex/responses"
+        captured.append(json)
+        return FakeUpstream()
+
+    monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"customModels": []}))
+    client = TestClient(TestServer(ShimServer(settings).app()))
+    await client.start_server()
+    try:
+        body = {
+            "model": sorted(FALLBACK_CHATGPT_PASSTHROUGH_SLUGS)[0], "stream": stream,
+            "prompt_cache_key": "tenant:conversation", "prompt_cache_retention": "24h",
+        }
+        if wire == "chat":
+            body["messages"] = [{"role": "system", "content": "Stable prefix"}, {"role": "user", "content": "hi"}]
+            endpoint = "/v1/chat/completions"
+        else:
+            body.update(instructions="Stable prefix", input="hi")
+            endpoint = "/v1/responses"
+        for request_id in ("request-one", "request-two"):
+            response = await client.post(endpoint, json=body, headers={"x-request-id": request_id})
+            assert response.status == 200
+            if stream:
+                events = [json.loads(line[6:]) for line in (await response.text()).splitlines()
+                          if line.startswith("data: ") and line != "data: [DONE]"]
+                if wire == "chat":
+                    result = next(event for event in events if "usage" in event)
+                else:
+                    result = next(event["response"] for event in events if event.get("type") == "response.completed")
+            else:
+                result = await response.json()
+            if wire == "chat":
+                assert result["usage"]["prompt_tokens"] == 2048
+                assert result["usage"]["prompt_tokens_details"]["cached_tokens"] == 1536
+                assert result["usage"]["completion_tokens_details"]["reasoning_tokens"] == 4
+            else:
+                assert result["usage"] == usage
+        assert captured[0] == captured[1]  # Transport request IDs never perturb the prompt.
+        assert captured[0]["prompt_cache_key"] == body["prompt_cache_key"]
+        assert captured[0]["prompt_cache_retention"] == body["prompt_cache_retention"]
+        assert captured[0]["instructions"] == "Stable prefix"
+        assert captured[0]["store"] is False
+        assert captured[0]["stream"] is True
+    finally:
+        await client.close()
+
+
 def test_sanitize_chatgpt_passthrough_body_drops_shim_reasoning():
     body = {
         "model": "claude-local",

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from codex_shim.cursor_passthrough import (
     CursorStreamParser,
     build_cursor_prompt,
@@ -68,7 +70,18 @@ def test_cursor_stream_parser_emits_deltas():
     assert parser.feed_line(line2) == "lo"
 
 
-async def test_iter_cursor_agent_events_does_not_kill_normal_completion(monkeypatch):
+@pytest.mark.parametrize("workspace", [None, "workspace", "absolute"])
+async def test_iter_cursor_agent_events_does_not_kill_normal_completion(monkeypatch, tmp_path, workspace):
+    monkeypatch.chdir(tmp_path)
+    expected_workspace = tmp_path
+    monkeypatch.delenv("CODEX_SHIM_CURSOR_WORKSPACE", raising=False)
+    if workspace is not None:
+        expected_workspace = tmp_path / workspace
+        expected_workspace.mkdir()
+        override = str(expected_workspace) if workspace == "absolute" else workspace
+        monkeypatch.setenv("CODEX_SHIM_CURSOR_WORKSPACE", override)
+    monkeypatch.setenv("CURSOR_AGENT_BIN", "bin/cursor-agent")
+    spawned = []
     class FakeStdin:
         def write(self, data):
             self.data = data
@@ -119,7 +132,11 @@ async def test_iter_cursor_agent_events_does_not_kill_normal_completion(monkeypa
 
     proc = FakeProc()
 
-    async def fake_create_subprocess_exec(*_args, **_kwargs):
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        spawned.append((args, kwargs))
+        assert args[0] == str(tmp_path / "bin/cursor-agent")
+        assert args[args.index("--workspace") + 1] == str(expected_workspace)
+        assert kwargs["cwd"] == str(expected_workspace)
         return proc
 
     monkeypatch.setattr(
@@ -132,3 +149,53 @@ async def test_iter_cursor_agent_events_does_not_kill_normal_completion(monkeypa
     assert proc.killed is False
     assert proc.returncode == 0
     assert events[-1] == {"type": "completed", "text": "Hello"}
+    assert not any(event["type"] == "usage" for event in events)
+    assert proc.stdin.data == b"prompt"
+
+    # Identical requests must not add per-request IDs or change launch context.
+    _ = [event async for event in iter_cursor_agent_events("prompt", "composer-2.5")]
+    assert spawned[0] == spawned[1]
+
+
+@pytest.mark.parametrize(
+    "usage, expected",
+    [
+        # Observed stream-json format: the installed CLI explicitly subtracts
+        # cache counters before serializing inputTokens.
+        (
+            {"inputTokens": 15712, "outputTokens": 34, "cacheReadTokens": 1152, "cacheWriteTokens": 0},
+            {"input_tokens": 15712, "output_tokens": 34, "cache_read_input_tokens": 1152, "cache_creation_input_tokens": 0},
+        ),
+        (
+            {"input_tokens": 10, "output_tokens": 2, "cache_read_input_tokens": 90, "cache_creation_input_tokens": 20},
+            {"input_tokens": 10, "output_tokens": 2, "cache_read_input_tokens": 90, "cache_creation_input_tokens": 20},
+        ),
+        # Responses-style totals/details must not become cache-exclusive usage.
+        (
+            {"input_tokens": 100, "output_tokens": 2, "input_tokens_details": {"cached_tokens": 90}},
+            {"input_tokens": 100, "output_tokens": 2, "input_tokens_details": {"cached_tokens": 90}},
+        ),
+        # Hook-style snake_case cache fields have different provenance; retain
+        # them without guessing their semantics from the spelling alone.
+        (
+            {"input_tokens": 100, "cache_read_tokens": 90, "cache_write_tokens": 0},
+            {"input_tokens": 100, "cache_read_tokens": 90, "cache_write_tokens": 0},
+        ),
+        ({"inputTokens": 10}, {"input_tokens": 10}),
+        ({"inputTokens": 0, "cacheReadTokens": 0}, {"input_tokens": 0, "cache_read_input_tokens": 0}),
+        ({"inputTokens": None, "cacheReadTokens": None}, {}),
+        ({"input_tokens": 7, "inputTokens": 10}, {"input_tokens": 7}),
+        ({}, {}),
+    ],
+)
+def test_cursor_stream_parser_preserves_usage_without_inventing_cache_hits(usage, expected):
+    parser = CursorStreamParser()
+    original = json.loads(json.dumps(usage))
+    parser.feed_line(json.dumps({"type": "result", "usage": usage}))
+    assert parser.usage == expected
+    assert usage == original
+
+
+def test_cursor_prompt_is_stable_across_identical_requests():
+    body = {"model": "cx-auto", "instructions": "Stable instructions", "input": "Hello"}
+    assert build_cursor_prompt(body) == build_cursor_prompt(body)

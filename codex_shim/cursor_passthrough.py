@@ -49,7 +49,8 @@ def cursor_spawn_env() -> dict[str, str]:
     env.pop("CURSOR_API_KEY", None)
     bin_override = env.get("CURSOR_AGENT_BIN", "").strip()
     if bin_override:
-        env["PATH"] = f"{os.path.dirname(bin_override)}:{env.get('PATH', '')}"
+        bin_dir = os.path.dirname(os.path.abspath(bin_override))
+        env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
     return env
 
 
@@ -127,7 +128,9 @@ def cursor_upstream_model(slug: str) -> str:
 
 def cursor_workspace() -> str:
     override = os.environ.get("CODEX_SHIM_CURSOR_WORKSPACE", "").strip()
-    return override or os.getcwd()
+    # Resolve relative overrides before using the path as both cwd and a CLI
+    # argument, otherwise --workspace would be resolved relative to itself.
+    return os.path.abspath(override or os.getcwd())
 
 
 def cursor_passthrough_display_names() -> dict[str, str]:
@@ -283,12 +286,24 @@ class CursorStreamParser:
                 self.final_text = str(obj["result"])
             usage = obj.get("usage")
             if isinstance(usage, dict):
-                self.usage = {
-                    "input_tokens": usage.get("inputTokens"),
-                    "output_tokens": usage.get("outputTokens"),
-                    "cache_read_input_tokens": usage.get("cacheReadTokens"),
-                    "cache_creation_input_tokens": usage.get("cacheWriteTokens"),
-                }
+                # Cursor CLI 2026.09.23's stream-json result subtracts cache
+                # reads/writes from inputTokens before emitting these camelCase
+                # counters. Thus this specific format is cache-exclusive, like
+                # Anthropic usage. Do not infer semantics from arbitrary snake
+                # case fields (e.g. hook cache_read_tokens), or invent counters
+                # when usage is absent/partial. Preserve native snake_case and
+                # nested details, including already-inclusive Responses usage.
+                self.usage = dict(usage)
+                for source, target in (
+                    ("inputTokens", "input_tokens"),
+                    ("outputTokens", "output_tokens"),
+                    ("cacheReadTokens", "cache_read_input_tokens"),
+                    ("cacheWriteTokens", "cache_creation_input_tokens"),
+                ):
+                    if source in self.usage:
+                        value = self.usage.pop(source)
+                        if value is not None:
+                            self.usage.setdefault(target, value)
             return None
         if obj_type == "error":
             self.error = str(obj.get("message") or obj.get("error") or "cursor-agent error")
@@ -312,8 +327,13 @@ async def iter_cursor_agent_events(
     prompt: str, model: str, *, read_only: bool = False
 ) -> AsyncIterator[dict[str, Any]]:
     """Spawn cursor-agent and yield normalized stream events."""
+    workspace = cursor_workspace()
+    agent_bin = _cursor_agent_bin()
+    # Keep relative executable overrides relative to the shim's original cwd.
+    if os.path.dirname(agent_bin) and not os.path.isabs(agent_bin):
+        agent_bin = os.path.abspath(agent_bin)
     cmd = [
-        _cursor_agent_bin(),
+        agent_bin,
         "--print",
         "--output-format",
         "stream-json",
@@ -321,7 +341,7 @@ async def iter_cursor_agent_events(
         "--force",
         "--trust",
         "--workspace",
-        cursor_workspace(),
+        workspace,
         "--model",
         model,
     ]
@@ -333,6 +353,7 @@ async def iter_cursor_agent_events(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=cursor_spawn_env(),
+        cwd=workspace,
     )
     assert proc.stdout is not None
     stderr_chunks: list[bytes] = []

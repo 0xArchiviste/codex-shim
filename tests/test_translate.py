@@ -19,6 +19,29 @@ from codex_shim.translate import (
 )
 
 
+def test_cache_controls_survive_chat_responses_roundtrip():
+    body = {
+        "messages": [{"role": "system", "content": "Stable prefix"}, {"role": "user", "content": "Hello"}],
+        "prompt_cache_key": "tenant:conversation",
+        "prompt_cache_retention": "24h",
+    }
+    converted = chat_to_responses_request(body, "gpt-5.5")
+    roundtrip = responses_to_chat(converted, "gpt-5.5")
+    for key in ("prompt_cache_key", "prompt_cache_retention"):
+        assert converted[key] == body[key]
+        assert roundtrip[key] == body[key]
+    assert converted == chat_to_responses_request(body, "gpt-5.5")
+    assert roundtrip["messages"] == body["messages"]
+
+
+def test_cache_controls_are_not_invented():
+    body = {"messages": [{"role": "user", "content": "Hello"}]}
+    converted = chat_to_responses_request(body, "gpt-5.5")
+    for result in (converted, responses_to_chat(converted, "gpt-5.5")):
+        assert "prompt_cache_key" not in result
+        assert "prompt_cache_retention" not in result
+
+
 def test_responses_to_chat_text_input():
     body = {"model": "slug", "instructions": "System", "input": "Hello", "stream": True, "max_output_tokens": 99}
     out = responses_to_chat(body, "real-model")

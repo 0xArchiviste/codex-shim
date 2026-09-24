@@ -279,6 +279,32 @@ Failures can consume tokens before usage is returned. Client or CLI retries
 can also repeat work. Consult provider usage for actual account consumption;
 never interpret a zero or missing usage field as a free request.
 
+### Cursor clients and other subscription backends
+
+There are two different Cursor roles: Cursor can consume this shim through its
+OpenAI-compatible Chat Completions endpoint, or the shim can spawn Cursor CLI
+for a `cx-*` upstream. Validate both paths; a working cache on one does not
+prove the other preserves cache metadata or usage.
+
+Chat/Responses translation preserves explicit `prompt_cache_key` and
+`prompt_cache_retention` in both directions, including Cursor BYOK requests
+forwarded to Codex. The shim does not generate cache keys or set a retention
+default; the selected upstream must support any caller-supplied controls.
+Streaming and nonstreaming regression tests cover forwarding and cache usage,
+and verify that transport request IDs do not change the upstream body.
+Cursor CLI uses the same absolute workspace for its argument and process cwd;
+its reported cache counters and native usage details are preserved.
+These checks establish shim behavior, not guaranteed provider cache hits.
+
+A two-request read-only Cursor Auto probe on 2026-09-24 reported 1,152 then
+4,352 cache-read tokens. Each request included roughly 16.9K total input tokens
+including CLI context despite a tiny user prompt. Avoid comparing only user
+prompt length when evaluating CLI overhead. Auto may select different backing
+models; changing models, context, instructions, or tools can reduce prefix reuse.
+Keep conversation prefixes stable and append new turns rather than rebuilding
+prior history with timestamps or random identifiers. Do not strip meaningful
+instructions or tools just to increase cache hit rate.
+
 ### UltraCode scope
 
 [claude-shim](https://github.com/petr-korobeinikov/claude-shim) provides useful

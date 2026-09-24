@@ -94,6 +94,8 @@ def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, An
     _copy_if_present(body, chat, "max_tokens")
     _copy_if_present(body, chat, "parallel_tool_calls")
     _copy_if_present(body, chat, "reasoning_effort")
+    _copy_if_present(body, chat, "prompt_cache_key")
+    _copy_if_present(body, chat, "prompt_cache_retention")
 
     tools = _responses_tools_to_chat_tools(body.get("tools"))
     if tools:
@@ -289,6 +291,8 @@ def chat_to_responses_request(body: dict[str, Any], upstream_model: str, max_tok
     if max_tokens and "max_output_tokens" not in converted:
         converted["max_output_tokens"] = max_tokens
     _copy_if_present(body, converted, "parallel_tool_calls")
+    _copy_if_present(body, converted, "prompt_cache_key")
+    _copy_if_present(body, converted, "prompt_cache_retention")
 
     tools = _chat_tools_to_responses_tools(body.get("tools"))
     if tools:
