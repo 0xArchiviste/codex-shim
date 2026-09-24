@@ -233,12 +233,13 @@ path, not the desktop app executable. An explicitly selected profile uses
 and refresh. Verify the selected CLI's login before enabling it in the daemon.
 Interactive sessions must never be resumed or reused by API requests.
 
-The initial adapter supports Chat Completions and Responses with explicit
-text history only. Anthropic Messages, Responses compaction, images,
-structured-output formats, implicit prior-response history, and client tools
-are unsupported. It disables local tools and session persistence, and rejects
-client tool requests instead of silently executing commands on the shim host
-or claiming transparent tool compatibility. No Claude Jev IO profiles are added.
+The adapter supports Chat Completions and Responses, including client tool
+definitions and prior tool results. It asks Claude to emit a fenced tool-call
+block, which the shim returns to the client for execution. Claude's own local
+tools stay disabled, so the shim host does not run the client's tools.
+Anthropic Messages, Responses compaction, images, structured-output formats,
+and implicit prior-response history remain unsupported. No Claude Jev IO
+profiles are added.
 
 `CODEX_SHIM_DISABLE_CLAUDE=1` disables discovery and routing. To correct model
 IDs for your account, set `CODEX_SHIM_CLAUDE_MODEL_OVERRIDES` to a JSON object

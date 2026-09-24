@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -113,20 +114,19 @@ def claude_catalog_entry(slug: str) -> dict[str, Any]:
     return entry
 
 
+_TOOL_FENCE = "codex-shim-tool"
+
+
 def build_claude_prompt(body: dict[str, Any]) -> str:
-    """Reject unsupported structured I/O rather than silently dropping it."""
-    if body.get("tools") or body.get("functions") or body.get("tool_choice") not in (None, "none") or body.get("function_call"):
-        raise ValueError("Claude Code bridge does not support client tools or tool choice")
+    """Render text and client tools. Claude's own tools stay disabled."""
     if body.get("response_format") or (body.get("text") or {}).get("format"):
         raise ValueError("Claude Code bridge does not support structured output formats")
     if body.get("previous_response_id"):
         raise ValueError("Claude Code bridge requires explicit conversation history")
     def validate(value: Any) -> None:
         if isinstance(value, dict):
-            if value.get("role") in {"tool", "function"} or value.get("tool_calls") or value.get("function_call"):
-                raise ValueError("Claude Code bridge does not support client tool history")
             kind = value.get("type", "")
-            if kind and kind not in {"message", "text", "input_text", "output_text"}:
+            if kind in {"input_image", "image_url", "image"}:
                 raise ValueError("Claude Code bridge supports text-only messages")
             for child in value.values():
                 validate(child)
@@ -138,12 +138,89 @@ def build_claude_prompt(body: dict[str, Any]) -> str:
     chat = responses_to_chat(body, str(body.get("model") or ""))
     sections = []
     for message in chat.get("messages", []):
-        content = message.get("content", "")
+        content = message.get("content") or ""
         if isinstance(content, list):
-            content = "\n".join(part.get("text", "") for part in content)
-        if content:
-            sections.append(f"[{str(message.get('role', 'user')).upper()}]\n{content}")
+            content = "\n".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
+        calls = message.get("tool_calls") or []
+        rendered_calls = []
+        for call in calls:
+            fn = call.get("function") or {}
+            rendered_calls.append(json.dumps({"call_id": call.get("id"), "name": fn.get("name"), "arguments": fn.get("arguments") or "{}"}, ensure_ascii=False))
+        if rendered_calls:
+            content = f"{content}\nTool calls: {', '.join(rendered_calls)}".strip()
+        if content or message.get("role") == "tool":
+            if not content:
+                content = "[empty tool result]"
+            label = message.get("role", "user").upper()
+            if label == "TOOL":
+                label = f"TOOL {message.get('tool_call_id', '')}"
+            sections.append(f"[{label}]\n{content}")
+    # This text bridge has no upstream tool-name restrictions. Keep the exact
+    # client name, not the OpenAI-sanitized name from responses_to_chat().
+    tools = body.get("tools") or []
+    if tools:
+        from .claude_tools import render_claude_tool_definitions
+        rendered = render_claude_tool_definitions(body)
+        choice = body.get("tool_choice") or chat.get("tool_choice") or "auto"
+        sections.append(
+            "[AVAILABLE CLIENT TOOLS]\n"
+            + rendered
+            + f"\n\nTool choice: {json.dumps(choice, sort_keys=True)}\n"
+            + "Do not execute tools yourself. When a client tool is required, reply with only this fence:\n"
+            + f"```{_TOOL_FENCE}\n"
+            + '{"tool_calls":[{"name":"tool_name","arguments":{}}]}\n'
+            + "```\nOtherwise answer in normal text and do not emit that fence."
+        )
     return "\n\n".join(sections) or "Continue."
+
+
+def parse_claude_tool_calls(text: str, allowed_names: set[str]) -> list[dict[str, str]]:
+    """Extract one complete tool reply atomically; invalid replies stay text."""
+    match = re.fullmatch(rf"\s*```{_TOOL_FENCE}\s*(\{{.*\}})\s*```\s*", text, re.DOTALL)
+    if not match:
+        return []
+    try:
+        payload = json.loads(match.group(1))
+        rows = payload.get("tool_calls")
+    except (json.JSONDecodeError, AttributeError):
+        return []
+    calls = []
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("name"), str) or row["name"] not in allowed_names:
+                return []
+            arguments = row.get("arguments", {})
+            if not isinstance(arguments, dict):
+                return []
+            calls.append({"name": row["name"], "arguments": json.dumps(arguments, sort_keys=True)})
+    return calls
+
+
+def claude_tool_names(body: dict[str, Any]) -> set[str]:
+    names = set()
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+            names.add(fn["name"])
+    return names
+
+
+def _claude_failure(data: dict[str, Any]) -> tuple[str, str]:
+    """Classify diagnostics locally; never echo upstream text or arbitrary subtypes."""
+    diagnostic = json.dumps({key: data.get(key) for key in
+                             ("error", "errors", "result", "subtype")}).lower()
+    if data.get("subtype") == "error_max_output_tokens":
+        return "claude_max_tokens", "Claude Code reached the output token limit"
+    if any(term in diagnostic for term in (
+        "rate_limit", "rate limit", "usage limit", "quota", "credit balance",
+        "insufficient_quota", "out of credits", "hit your limit",
+    )):
+        return "claude_quota_exceeded", "Claude Code reported a quota or rate limit"
+    if any(term in diagnostic for term in ("timeout", "timed out", "time out")):
+        return "claude_timeout", "Claude Code reported an upstream timeout"
+    return "claude_upstream_error", "Claude Code returned an upstream error"
 
 
 class ClaudeStreamParser:
@@ -153,6 +230,17 @@ class ClaudeStreamParser:
         self.result_seen = False
         self.usage: dict[str, Any] | None = None
         self.error: str | None = None
+        self.error_code = "claude_upstream_error"
+        self.stop_reason: str | None = None
+
+    def _capture_metadata(self, data: dict[str, Any]) -> None:
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            # Snapshots, not increments: stream deltas report cumulative output.
+            self.usage = {**(self.usage or {}), **usage}
+        reason = data.get("stop_reason")
+        if isinstance(reason, str):
+            self.stop_reason = reason
 
     def feed_line(self, line: str) -> str:
         data = json.loads(line)
@@ -160,10 +248,19 @@ class ClaudeStreamParser:
         delta = ""
         if kind == "stream_event":
             event = data.get("event", {})
+            if event.get("type") == "message_start":
+                self._capture_metadata(event.get("message", {}))
+            elif event.get("type") == "message_delta":
+                self._capture_metadata(event)
+                self._capture_metadata(event.get("delta", {}))
             if event.get("type") == "content_block_delta" and event.get("delta", {}).get("type") == "text_delta":
                 self.partial = True
                 delta = event["delta"].get("text", "")
         elif kind == "assistant":
+            self._capture_metadata(data.get("message", {}))
+            if data.get("error"):
+                self.error_code, self.error = _claude_failure(data)
+                return ""
             blocks = data.get("message", {}).get("content", [])
             if any(block.get("type") == "tool_use" for block in blocks):
                 self.error = "Claude Code unexpectedly requested a tool; bridge is text-only"
@@ -171,13 +268,19 @@ class ClaudeStreamParser:
                 delta = "".join(block.get("text", "") for block in blocks if block.get("type") == "text")
         elif kind == "result":
             self.result_seen = True
-            self.usage = data.get("usage")
+            self._capture_metadata(data)
             if data.get("is_error") or data.get("subtype") not in (None, "success"):
-                self.error = "Claude Code request failed (" + str(data.get("subtype") or "error") + ")"
-            elif not self.text:
+                if self.stop_reason == "max_tokens":
+                    self.error_code, self.error = "claude_max_tokens", "Claude Code reached the output token limit"
+                else:
+                    code, message = _claude_failure(data)
+                    if not self.error or code != "claude_upstream_error":
+                        self.error_code, self.error = code, message
+            elif not self.text and not self.error:
                 delta = data.get("result", "")
         elif kind == "error":
-            self.error = "Claude Code returned an upstream error"
+            self._capture_metadata(data)
+            self.error_code, self.error = _claude_failure(data)
         self.text += delta
         return delta
 
@@ -202,6 +305,7 @@ async def iter_claude_agent_events(prompt: str, slug: str) -> AsyncIterator[dict
     proc = None
     stderr_task = None
     parser = ClaudeStreamParser()
+    emitted_usage = None
     with claude_request_workspace() as cwd:
         try:
             argv = [claude_bin(), "--print", "--output-format", "stream-json", "--verbose",
@@ -225,17 +329,26 @@ async def iter_claude_agent_events(prompt: str, slug: str) -> AsyncIterator[dict
                     if not raw.strip():
                         continue
                     delta = parser.feed_line(raw.decode("utf-8"))
-                    if parser.error:
-                        yield {"type": "error", "code": "claude_upstream_error", "message": parser.error}
+                    if parser.usage is not None and parser.usage != emitted_usage:
+                        emitted_usage = dict(parser.usage)
+                        yield {"type": "usage", "usage": emitted_usage}
+                    # Error envelopes may precede the billable result: drain safely.
+                    if parser.error and parser.result_seen:
+                        yield {"type": "error", "code": parser.error_code, "message": parser.error}
                         return
-                    if delta:
+                    if delta and not parser.error:
                         yield {"type": "text_delta", "delta": delta}
                 code = await proc.wait()
+                if parser.error:
+                    yield {"type": "error", "code": parser.error_code, "message": parser.error}
+                    return
                 if code or not parser.result_seen:
                     yield {"type": "error", "code": "claude_process_error", "message": "Claude Code exited unsuccessfully or without a final result"}
                     return
-                if parser.usage:
-                    yield {"type": "usage", "usage": parser.usage}
+                if parser.stop_reason == "max_tokens":
+                    # Fail closed: the server has no incomplete-completion contract.
+                    yield {"type": "error", "code": "claude_max_tokens", "message": "Claude Code reached the output token limit", "stop_reason": "max_tokens"}
+                    return
                 yield {"type": "completed", "text": parser.text}
         except TimeoutError:
             yield {"type": "error", "code": "claude_timeout", "message": "Claude Code request timed out"}

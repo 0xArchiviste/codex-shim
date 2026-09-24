@@ -76,7 +76,8 @@ async def test_chatgpt_cache_controls_and_usage(monkeypatch, tmp_path, auth_pres
     monkeypatch.setattr("codex_shim.server.ClientSession.post", fake_post)
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"customModels": []}))
-    client = TestClient(TestServer(ShimServer(settings).app()))
+    shim = ShimServer(settings)
+    client = TestClient(TestServer(shim.app()))
     await client.start_server()
     try:
         body = {
@@ -107,6 +108,15 @@ async def test_chatgpt_cache_controls_and_usage(monkeypatch, tmp_path, auth_pres
                 assert result["usage"]["completion_tokens_details"]["reasoning_tokens"] == 4
             else:
                 assert result["usage"] == usage
+        # Middleware persists asynchronously after the streaming handler finishes.
+        await client.close()
+        if shim.usage_store is not None:
+            snapshot = shim.usage_store.snapshot()
+            assert snapshot["requests"] == 2
+            assert snapshot["totals"]["input_tokens"]["known_total"] == 4096
+            assert snapshot["totals"]["cached_tokens"]["known_total"] == 3072
+            assert all(row["status"] == "completed" for row in snapshot["recent"])
+            assert all(row["cache_write_tokens"] is None for row in snapshot["recent"])
         assert captured[0] == captured[1]  # Transport request IDs never perturb the prompt.
         assert captured[0]["prompt_cache_key"] == body["prompt_cache_key"]
         assert captured[0]["prompt_cache_retention"] == body["prompt_cache_retention"]

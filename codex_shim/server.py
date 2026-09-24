@@ -17,7 +17,8 @@ from aiohttp import ClientSession, ClientTimeout, web
 from contextlib import aclosing
 from .claude_passthrough import (
     build_claude_prompt, claude_passthrough_available, claude_passthrough_display_names,
-    is_claude_passthrough_slug, iter_claude_agent_events,
+    claude_tool_names, is_claude_passthrough_slug, iter_claude_agent_events,
+    parse_claude_tool_calls,
 )
 from .cursor_passthrough import (
     CURSOR_MODEL_SLUG,
@@ -28,6 +29,8 @@ from .cursor_passthrough import (
     is_cursor_passthrough_slug,
     iter_cursor_agent_events,
 )
+from . import telemetry
+from .usage_ui import usage_html
 from . import ensemble as ensemble_module
 from . import router as router_module
 from . import io_profiles as io_profiles_module
@@ -193,6 +196,12 @@ class ShimServer:
         self.picker_token = secrets.token_urlsafe(32)
         self.api_key = load_shim_api_key()
         self.context_store = ContextStore()
+        self.usage_store = None
+        if os.environ.get("CODEX_SHIM_USAGE_ENABLED", "1").lower() not in {"0", "false", "no", "off"}:
+            try:
+                self.usage_store = telemetry.UsageStore()
+            except (OSError, ValueError, telemetry.StorageError):
+                print("[usage] storage unavailable; inference remains enabled", flush=True)
 
     def app(self) -> web.Application:
         allowed_hosts = build_allowed_hosts(self.host)
@@ -203,6 +212,10 @@ class ShimServer:
                 api_key_middleware(self.api_key),
             ],
         )
+        if self.usage_store is not None:
+            app.middlewares.append(telemetry.usage_middleware(self.usage_store))
+        app.router.add_get("/usage", self.usage_page)
+        app.router.add_get("/v1/usage", self.usage_stats)
         app.router.add_get("/health", self.health)
         app.router.add_get("/v1/models", self.models)
         app.router.add_post("/v1/chat/completions", self.chat_completions)
@@ -213,6 +226,22 @@ class ShimServer:
         app.router.add_get("/api/models", self.api_models)
         app.router.add_post("/api/switch", self.switch_model)
         return app
+
+    async def usage_page(self, _request: web.Request) -> web.Response:
+        return web.Response(text=usage_html(), content_type="text/html", headers={
+            "Cache-Control": "no-store", "X-Frame-Options": "DENY",
+            "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+        })
+
+    async def usage_stats(self, request: web.Request) -> web.Response:
+        # Statistics fail closed even when legacy inference auth is disabled.
+        if not _keys_match(_request_api_key(request), self.api_key):
+            raise web.HTTPUnauthorized(text="Shim API key required")
+        if self.usage_store is None:
+            return web.json_response({"error": "usage_storage_unavailable"}, status=503)
+        import asyncio
+        data = await asyncio.to_thread(self.usage_store.snapshot)
+        return web.json_response(data, headers={"Cache-Control": "no-store"})
 
     async def picker_page(self, _request: web.Request) -> web.Response:
         return web.Response(text=_picker_html(self.picker_token), content_type="text/html")
@@ -393,7 +422,8 @@ class ShimServer:
     async def chat_completions(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
         _log_incoming_request("/v1/chat/completions", body)
-        body = await self._maybe_apply_auto_router(body)
+        with telemetry.suspend():
+            body = await self._maybe_apply_auto_router(body)
         ensemble_response = await self._maybe_ensemble(request, body, wire="chat")
         if ensemble_response is not None:
             return ensemble_response
@@ -441,7 +471,8 @@ class ShimServer:
 
     async def anthropic_messages(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
-        body = await self._maybe_apply_auto_router(body)
+        with telemetry.suspend():
+            body = await self._maybe_apply_auto_router(body)
         model = str(body.get("model") or "")
         if is_chatgpt_passthrough_slug(model):
             upstream = chatgpt_upstream_model(model)
@@ -481,7 +512,8 @@ class ShimServer:
     async def responses(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
         _log_incoming_request("/v1/responses", body)
-        body = await self._maybe_apply_auto_router(body)
+        with telemetry.suspend():
+            body = await self._maybe_apply_auto_router(body)
         ensemble_response = await self._maybe_ensemble(request, body, wire="responses")
         if ensemble_response is not None:
             return ensemble_response
@@ -523,7 +555,8 @@ class ShimServer:
     async def responses_compact(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
         _log_incoming_request("/v1/responses/compact", body)
-        body = await self._maybe_apply_auto_router(body)
+        with telemetry.suspend():
+            body = await self._maybe_apply_auto_router(body)
         model = str(body.get("model") or "")
         if is_claude_passthrough_slug(model):
             return web.json_response({"error": {"type": "invalid_request_error", "message": "Claude Code bridge does not support Responses compaction"}}, status=400)
@@ -815,8 +848,10 @@ class ShimServer:
                         await _write_sse(response, payload)
                 else:
                     async for chunk in upstream.content.iter_chunked(4096):
+                        telemetry.observe_chunk(chunk)
                         await _safe_write(response, chunk)
             except ClientDisconnected:
+                telemetry.mark_disconnected()
                 pass
             finally:
                 upstream.release()
@@ -861,10 +896,21 @@ class ShimServer:
             if upstream.status >= 400:
                 return await _error_response(upstream)
             payload = await upstream.json(content_type=None)
+            telemetry.observe(payload)
         _rewrite_response_model(payload, original_model or None)
         return web.json_response(payload)
 
     async def _claude_passthrough(self, request, body, slug, *, as_chat=False):
+        # Cover both upstream reads and the final buffered tool emission.
+        try:
+            return await self._claude_passthrough_impl(request, body, slug, as_chat=as_chat)
+        except (ClientDisconnected, ConnectionResetError):
+            request["shim_client_disconnected"] = True
+            return web.StreamResponse()
+
+    async def _claude_passthrough_impl(self, request, body, slug, *, as_chat=False):
+        from .stream_liveness import with_liveness
+
         try:
             prompt = build_claude_prompt(body)
         except ValueError as exc:
@@ -872,6 +918,7 @@ class ShimServer:
         if not claude_passthrough_available():
             return web.json_response({"error": {"type": "authentication_error", "code": "claude_unavailable", "message": "Claude Code subscription login unavailable; configure CLAUDE_CODE_BIN and run Claude login."}}, status=401)
         stream = bool(body.get("stream"))
+        tool_names = claude_tool_names(body)
         response = _sse_response() if stream else None
         state = ResponsesToChatStreamState(slug) if as_chat else ResponsesStreamState(slug, {})
         if stream:
@@ -880,19 +927,28 @@ class ShimServer:
                 await state.start(response)
         text, usage = "", None
         try:
-            async with aclosing(iter_claude_agent_events(prompt, slug)) as events:
-                async for event in events:
+            async with aclosing(iter_claude_agent_events(prompt, slug)) as events, aclosing(with_liveness(
+                events,
+                disconnected=lambda: request.transport is None or request.transport.is_closing(),
+                heartbeat=(lambda: _safe_write(response, b": keep-alive\n\n")) if stream else None,
+            )) as live_events:
+                async for event in live_events:
+                    telemetry.observe(event)
                     kind = event["type"]
                     if kind == "error":
                         error = {"type": "upstream_error", "code": event.get("code"), "message": event["message"]}
+                        failure = {"error": error}
+                        if usage is not None:
+                            failure["usage"] = usage
                         if not stream:
-                            return web.json_response({"error": error}, status=502)
-                        await _write_sse(response, {"type": "error", "error": error})
+                            return web.json_response(failure, status=502)
+                        await _write_sse(response, {"type": "error", **failure})
                         await response.write_eof()
                         return response
                     if kind == "text_delta":
                         text += event["delta"]
-                        if stream:
+                        # Tool requests are buffered so a tool fence is not shown as answer text.
+                        if stream and not tool_names:
                             if as_chat:
                                 for chunk in state.text_delta(event["delta"]):
                                     await _write_sse(response, chunk)
@@ -902,8 +958,40 @@ class ShimServer:
                         usage = normalize_responses_usage(event.get("usage"))
                     elif kind == "completed":
                         text = event.get("text", text)
-        except ClientDisconnected:
+        except (ClientDisconnected, ConnectionResetError):
+            request["shim_client_disconnected"] = True
+            return response or web.StreamResponse()
+        from .claude_tools import validate_claude_tool_reply
+        try:
+            tool_calls = validate_claude_tool_reply(text, body)
+        except ValueError as exc:
+            failure = {"error": {"type": "upstream_error", "code": "claude_tool_protocol_error", "message": str(exc)}}
+            if usage is not None:
+                failure["usage"] = usage
+            telemetry.observe({"type": "error", **failure})
+            if not stream:
+                return web.json_response(failure, status=502)
+            await _write_sse(response, {"type": "error", **failure})
+            await response.write_eof()
             return response
+        # IDs must not collide with earlier turns in Cursor's tool history.
+        call_batch = uuid.uuid4().hex
+        if tool_calls:
+            text = ""
+        if stream and tool_names and not tool_calls and text:
+            if as_chat:
+                for chunk in state.text_delta(text):
+                    await _write_sse(response, chunk)
+            else:
+                await state.write_chat_delta(response, {"choices": [{"delta": {"content": text}}]})
+        if stream and tool_calls:
+            for index, call in enumerate(tool_calls):
+                item = {"type": "function_call", "id": f"fc_{call_batch}_{index}", "call_id": f"call_{call_batch}_{index}", "name": call["name"], "arguments": call["arguments"]}
+                if as_chat:
+                    for chunk in state.handle_event({"type": "response.output_item.added", "item": item}):
+                        await _write_sse(response, chunk)
+                else:
+                    await state.write_chat_delta(response, {"choices": [{"delta": {"tool_calls": [{"index": index, "id": item["call_id"], "type": "function", "function": {"name": call["name"], "arguments": call["arguments"]}}]}}]})
         if stream:
             if usage:
                 state.usage = usage
@@ -915,9 +1003,10 @@ class ShimServer:
                 await state.finish(response)
             await response.write_eof()
             return response
-        payload = {"id": f"resp_{uuid.uuid4().hex}", "object": "response", "model": slug,
-                   "status": "completed", "output": [{"id": "msg_0", "type": "message", "role": "assistant",
-                   "status": "completed", "content": [{"type": "output_text", "text": text, "annotations": []}]}]}
+        output = [{"type": "function_call", "id": f"fc_{call_batch}_{index}", "call_id": f"call_{call_batch}_{index}", "name": call["name"], "arguments": call["arguments"]} for index, call in enumerate(tool_calls)]
+        if not output:
+            output = [{"id": "msg_0", "type": "message", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": text, "annotations": []}]}]
+        payload = {"id": f"resp_{uuid.uuid4().hex}", "object": "response", "model": slug, "status": "completed", "output": output}
         if usage:
             payload["usage"] = usage
         return web.json_response(response_to_chat_completion(payload, slug) if as_chat else payload)
@@ -946,6 +1035,7 @@ class ShimServer:
             text = ""
             usage: dict[str, Any] | None = None
             async for event in iter_cursor_agent_events(prompt, upstream):
+                telemetry.observe(event)
                 if event["type"] == "completed":
                     text = str(event.get("text") or text)
                 elif event["type"] == "usage":
@@ -983,6 +1073,7 @@ class ShimServer:
             try:
                 await anthropic_state.start(response)
                 async for event in iter_cursor_agent_events(prompt, upstream):
+                    telemetry.observe(event)
                     if event["type"] == "text_delta":
                         await anthropic_state.write_chat_delta(
                             response,
@@ -1001,6 +1092,7 @@ class ShimServer:
                         break
                 await anthropic_state.finish(response)
             except ClientDisconnected:
+                telemetry.mark_disconnected()
                 pass
             except Exception as exc:
                 print(f"[err] cursor passthrough {slug}: {exc}", flush=True)
@@ -1017,6 +1109,7 @@ class ShimServer:
             chat_state = ResponsesToChatStreamState(slug)
             try:
                 async for event in iter_cursor_agent_events(prompt, upstream):
+                    telemetry.observe(event)
                     if event["type"] == "text_delta":
                         for chunk in chat_state.text_delta(str(event["delta"])):
                             await _write_sse(response, chunk)
@@ -1033,6 +1126,7 @@ class ShimServer:
                     await _write_sse(response, chunk)
                 await _safe_write(response, b"data: [DONE]\n\n")
             except ClientDisconnected:
+                telemetry.mark_disconnected()
                 pass
             except Exception as exc:
                 print(f"[err] cursor passthrough {slug}: {exc}", flush=True)
@@ -1050,6 +1144,7 @@ class ShimServer:
         try:
             await state.start(response)
             async for event in iter_cursor_agent_events(prompt, upstream):
+                telemetry.observe(event)
                 if event["type"] == "text_delta":
                     await state.write_chat_delta(
                         response,
@@ -1068,6 +1163,7 @@ class ShimServer:
                     break
             await state.finish(response)
         except ClientDisconnected:
+            telemetry.mark_disconnected()
             pass
         except Exception as exc:
             print(f"[err] cursor passthrough {slug}: {exc}", flush=True)
@@ -1183,6 +1279,7 @@ class ShimServer:
         mix = ensemble_module.find_mix(config, str(body.get("model") or ""))
         if mix is None:
             return None
+        telemetry.mark_auxiliary()
         available = available_model_slugs(self.settings.load())
         candidates = ensemble_module.filter_candidates(mix, available)
         if len(candidates) < 2:
@@ -1523,6 +1620,7 @@ class ShimServer:
         profile = io_profiles_module.find_profile(config, str(body.get("model") or ""))
         if profile is None:
             return None
+        telemetry.mark_auxiliary()
         active_slugs = {item.slug for item in self._active_io_profiles()}
         if profile.slug not in active_slugs:
             raise web.HTTPUnauthorized(
@@ -1876,6 +1974,7 @@ class ShimServer:
             if body.get("stream"):
                 return await self._stream_openai_chat(request, upstream, route, as_responses, body)
             payload = await upstream.json(content_type=None)
+            telemetry.observe(payload)
         if as_responses:
             tool_types = _build_tool_types(body)
             payload = chat_completion_to_response(payload, route.slug, tool_types)
@@ -1896,6 +1995,7 @@ class ShimServer:
             if body.get("stream"):
                 return await self._stream_openai_chat_as_anthropic(request, upstream, route)
             payload = await upstream.json(content_type=None)
+            telemetry.observe(payload)
         return web.json_response(chat_completion_to_anthropic_message(payload, route.slug))
 
     async def _post_anthropic(
@@ -1910,6 +2010,7 @@ class ShimServer:
             if body.get("stream"):
                 return await self._stream_anthropic(request, upstream, route, as_responses, body)
             payload = await upstream.json(content_type=None)
+            telemetry.observe(payload)
         if as_responses:
             tool_types = _build_tool_types(body)
             payload = anthropic_to_response(payload, route.slug, tool_types)
@@ -1929,6 +2030,7 @@ class ShimServer:
             if body.get("stream"):
                 return await self._stream_raw_sse(request, upstream, route.slug)
             payload = await upstream.json(content_type=None)
+            telemetry.observe(payload)
         if isinstance(payload, dict):
             payload["model"] = route.slug
         return web.json_response(payload)
@@ -1960,6 +2062,7 @@ class ShimServer:
             else:
                 await _safe_write(response, b"data: [DONE]\n\n")
         except ClientDisconnected:
+            telemetry.mark_disconnected()
             pass
         finally:
             upstream.release()
@@ -1987,6 +2090,7 @@ class ShimServer:
                 await state.write_chat_delta(response, event)
             await state.finish(response)
         except ClientDisconnected:
+            telemetry.mark_disconnected()
             pass
         finally:
             upstream.release()
@@ -2023,6 +2127,7 @@ class ShimServer:
             else:
                 await _safe_write(response, b"data: [DONE]\n\n")
         except ClientDisconnected:
+            telemetry.mark_disconnected()
             pass
         finally:
             upstream.release()
@@ -2050,6 +2155,7 @@ class ShimServer:
                         pass
                 await _safe_write(response, f"data: {line}\n\n".encode())
         except ClientDisconnected:
+            telemetry.mark_disconnected()
             pass
         finally:
             upstream.release()
@@ -2083,6 +2189,7 @@ class ShimServer:
                 await _write_sse(response, chunk)
             await _safe_write(response, b"data: [DONE]\n\n")
         except ClientDisconnected:
+            telemetry.mark_disconnected()
             pass
         finally:
             upstream.release()
@@ -2114,6 +2221,7 @@ class ShimServer:
                 await anthropic_state.write_chat_delta(response, chunk)
             await anthropic_state.finish(response)
         except ClientDisconnected:
+            telemetry.mark_disconnected()
             pass
         finally:
             upstream.release()
@@ -3438,9 +3546,11 @@ async def _sse_lines(upstream) -> Any:
             raw, buffer = buffer.split(b"\n", 1)
             line = raw.decode("utf-8", errors="replace").strip()
             if line.startswith("data:"):
+                telemetry.observe_line(line[5:].strip())
                 yield line[5:].strip()
     tail = buffer.decode("utf-8", errors="replace").strip()
     if tail.startswith("data:"):
+        telemetry.observe_line(tail[5:].strip())
         yield tail[5:].strip()
 
 

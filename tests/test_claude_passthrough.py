@@ -8,8 +8,6 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from codex_shim import claude_passthrough as claude
-from codex_shim import server
-
 
 @pytest.fixture
 def claude_enabled(monkeypatch):
@@ -78,11 +76,17 @@ def test_aliases_overrides(monkeypatch):
     assert claude.claude_upstream_model("cd-fable-high") == "verified-model"
 
 
+def test_client_tools_are_prompted_but_not_executed():
+    body = {"model": "cd-opus-5-5-medium", "tool_choice": "auto", "tools": [{"type": "function", "name": "Read", "parameters": {"type": "object"}}], "input": [{"type": "function_call", "name": "Read", "arguments": "{\"path\":\"a\"}", "call_id": "call_0"}, {"type": "function_call_output", "call_id": "call_0", "output": "contents"}]}
+    prompt = claude.build_claude_prompt(body)
+    assert "Read" in prompt and "codex-shim-tool" in prompt and "contents" in prompt
+    assert claude.parse_claude_tool_calls('```codex-shim-tool\n{"tool_calls":[{"name":"Read","arguments":{"path":"a"}}]}\n```', {"Read"}) == [{"name": "Read", "arguments": '{"path": "a"}'}]
+    assert claude.parse_claude_tool_calls('```codex-shim-tool\n{"tool_calls":[{"name":"Shell","arguments":{}}]}\n```', {"Read"}) == []
+
+
 @pytest.mark.parametrize("body", [
-    {"tools": [{"type": "function"}]}, {"tool_choice": "auto"},
-    {"input": [{"type": "function_call", "name": "foo"}]},
-    {"messages": [{"role": "tool", "content": "result"}]},
     {"input": [{"role": "user", "content": [{"type": "input_image"}]}]},
+    {"response_format": {"type": "json_object"}},
 ])
 def test_unsupported_requests(body):
     with pytest.raises(ValueError):
@@ -197,6 +201,7 @@ async def test_process_errors(monkeypatch, lines):
 @pytest.mark.parametrize("endpoint,field", [("/v1/responses", "input"), ("/v1/chat/completions", "messages")])
 @pytest.mark.parametrize("stream", [False, True])
 async def test_routing(monkeypatch, tmp_path, endpoint, field, stream):
+    from codex_shim import server
     monkeypatch.setattr(server, "claude_passthrough_available", lambda: True)
     async def events(prompt, slug):
         assert "hello" in prompt and slug == "cd-fable-high"
@@ -211,8 +216,15 @@ async def test_routing(monkeypatch, tmp_path, endpoint, field, stream):
         assert response.status == 200
         text = await response.text()
         assert "answer" in text and "cd-fable-high" in text
-        bad = await client.post(endpoint, json={"model": "cd-fable-high", field: [], "tools": [{"type": "function"}]})
-        assert bad.status == 400
+        tool_reply = '```codex-shim-tool\n{"tool_calls":[{"name":"Read","arguments":{"path":"a"}}]}\n```'
+        async def tool_events(prompt, slug):
+            assert "Read" in prompt
+            yield {"type": "completed", "text": tool_reply}
+        monkeypatch.setattr(server, "iter_claude_agent_events", tool_events)
+        tool_body = {"model": "cd-fable-high", field: [{"role": "user", "content": "read a"}], "tools": [{"type": "function", "function": {"name": "Read", "parameters": {"type": "object"}}}], "stream": stream}
+        tooled = await client.post(endpoint, json=tool_body)
+        assert tooled.status == 200
+        assert "Read" in await tooled.text()
         models = await (await client.get("/v1/models")).json()
         assert any(row["id"] == "cd-fable-high" for row in models["data"])
         health = await (await client.get("/health")).json()
@@ -229,6 +241,7 @@ async def test_spawn_failure(monkeypatch, exception, code):
 
 
 async def test_route_auth_and_structured_errors(monkeypatch, tmp_path):
+    from codex_shim import server
     settings = tmp_path / "settings.json"
     settings.write_text('{"models":[]}')
     shim = server.ShimServer(settings)
@@ -247,3 +260,89 @@ async def test_route_auth_and_structured_errors(monkeypatch, tmp_path):
             assert "claude_upstream_error" in text
             assert '"status": "completed"' not in text
             assert response.status == (200 if stream else 502)
+
+
+@pytest.mark.parametrize("diagnostic,code", [
+    ("sensitive prompt sk-secret", "claude_upstream_error"),
+    ("Credit balance is too low sk-secret", "claude_quota_exceeded"),
+    ("You've hit your limit sk-secret", "claude_quota_exceeded"),
+    ("Request timed out sk-secret", "claude_timeout"),
+])
+async def test_error_result_preserves_usage_safely(monkeypatch, diagnostic, code):
+    usage = {"input_tokens": 12, "output_tokens": 3}
+    proc = FakeProc([{"type": "result", "subtype": "success", "is_error": True,
+                      "result": diagnostic, "usage": usage}])
+    async def spawn(*args, **kwargs):
+        return proc
+    monkeypatch.setattr(claude.asyncio, "create_subprocess_exec", spawn)
+    events = [event async for event in claude.iter_claude_agent_events("prompt", "cd-fable-high")]
+    assert events[0] == {"type": "usage", "usage": usage}
+    assert events[1]["type"] == "error" and events[1]["code"] == code
+    assert len(events) == 2
+    assert "sk-secret" not in str(events) and "success" not in str(events)
+    assert proc.killed
+
+
+async def test_assistant_error_drains_final_usage(monkeypatch):
+    proc = FakeProc([
+        {"type": "assistant", "error": "rate_limit", "message": {"content": [{"type": "text", "text": "private diagnostic"}]}},
+        {"type": "result", "is_error": True, "subtype": "success", "usage": {"output_tokens": 2}},
+    ])
+    async def spawn(*args, **kwargs):
+        return proc
+    monkeypatch.setattr(claude.asyncio, "create_subprocess_exec", spawn)
+    events = [event async for event in claude.iter_claude_agent_events("prompt", "cd-fable-high")]
+    assert [event["type"] for event in events] == ["usage", "error"]
+    assert "private diagnostic" not in str(events)
+
+
+@pytest.mark.parametrize("ending", ["eof", "exit", "malformed", "timeout", "max_tokens"])
+async def test_cutoff_preserves_reported_usage(monkeypatch, ending):
+    lines = [
+        {"type": "stream_event", "event": {"type": "message_start", "message": {"usage": {"input_tokens": 9, "output_tokens": 0}}}},
+        {"type": "stream_event", "event": {"type": "message_delta", "usage": {"output_tokens": 4}, "delta": {"stop_reason": "max_tokens" if ending == "max_tokens" else "end_turn"}}},
+    ]
+    if ending in {"exit", "max_tokens"}:
+        lines.append({"type": "result", "subtype": "success"})
+    if ending == "malformed":
+        lines.append(None)
+    proc = FakeProc(lines)
+    if ending == "exit":
+        proc.returncode = 1
+    if ending == "timeout":
+        original_readline = proc.stdout.readline
+        async def readline():
+            line = await original_readline()
+            if not line:
+                raise TimeoutError
+            return line
+        monkeypatch.setattr(proc.stdout, "readline", readline)
+    async def spawn(*args, **kwargs):
+        return proc
+    monkeypatch.setattr(claude.asyncio, "create_subprocess_exec", spawn)
+    events = [event async for event in claude.iter_claude_agent_events("prompt", "cd-fable-high")]
+    assert events[-2] == {"type": "usage", "usage": {"input_tokens": 9, "output_tokens": 4}}
+    assert events[-1]["type"] == "error"
+    assert events[-1]["code"] == {"timeout": "claude_timeout", "max_tokens": "claude_max_tokens"}.get(ending, "claude_process_error")
+    assert not any(event["type"] == "completed" for event in events)
+
+
+@pytest.mark.parametrize("bad_row", [
+    {"name": "Unknown", "arguments": {}},
+    {"name": ["Read"], "arguments": {}},
+    {"name": "Read", "arguments": []},
+    {"name": "Read", "arguments": "{}"},
+    None,
+])
+def test_tool_parser_never_emits_partial_batch(bad_row):
+    payload = {"tool_calls": [{"name": "Read", "arguments": {}}, bad_row]}
+    assert claude.parse_claude_tool_calls('```codex-shim-tool\n' + json.dumps(payload) + '\n```', {"Read"}) == []
+
+
+@pytest.mark.parametrize("text", [
+    '```codex-shim-tool\n{"tool_calls": [',
+    'Example: ```codex-shim-tool\n{"tool_calls":[{"name":"Read","arguments":{}}]}\n```',
+    '```codex-shim-tool\n{}\n```\n```codex-shim-tool\n{}\n```',
+])
+def test_tool_parser_rejects_incomplete_or_mixed_reply(text):
+    assert claude.parse_claude_tool_calls(text, {"Read"}) == []

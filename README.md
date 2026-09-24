@@ -1255,6 +1255,55 @@ Config behavior:
 
 ---
 
+## Persistent usage dashboard
+
+Open `http://127.0.0.1:8765/usage` (use your configured shim port) and enter
+**the same shim API key as your client**. The static page is public, but
+`GET /v1/usage` always requires a valid bearer or `x-api-key`/`api-key` header,
+even if inference authentication is not configured. A missing key fails closed.
+The key stays in page memory: it is never put in a URL or browser storage.
+The existing Host guard also protects both routes; keep the shim bound to loopback
+unless you intentionally configure secure remote access.
+
+Usage is stored using Python's standard-library SQLite support:
+
+- `CODEX_SHIM_USAGE_ENABLED=0` disables capture (enabled by default).
+- `CODEX_SHIM_USAGE_DB` overrides `~/.local/state/codex-shim/usage.sqlite3`.
+- `CODEX_SHIM_USAGE_RETENTION_DAYS` defaults to `30`.
+- `CODEX_SHIM_USAGE_MAX_ROWS` defaults to `10000`.
+
+The database is created mode `0600`; newly created containing directories are
+private (`0700`). Choose a private directory when overriding the location.
+Retention is enforced on writes and stats reads. No additional dependency is
+needed, but Python must have its `_sqlite3` extension. If storage cannot initialize,
+inference still works and statistics return 503. Storage writes run off the event
+loop; a storage failure never changes an inference response.
+
+Each accepted inference request records a generated request ID, requested model,
+endpoint, timestamp, duration, HTTP status, completion/error/partial/disconnect
+state, and provider-reported input/output/cache-read/cache-write token counters.
+No prompts, output, credentials, or raw error text are persisted by this feature.
+Existing debug logging is separate and unaffected. The API returns retention-wide
+known totals and explicit unknown counts, model groups, and the latest 200 requests.
+Unknown counters are `null`, not zero. Cache reads are a subset of normalized
+input tokens; no prices, credits, or dollar estimates are invented.
+
+Capture observes original usage before wire translation for Chat Completions,
+Responses, Messages, compaction, Claude Code, and Cursor bridges. Streams are not
+buffered for telemetry; repeated cumulative usage replaces previous counters,
+rather than being added twice. The raw SSE observer keeps at most 256 KiB for
+one line and skips oversized events. Disconnects or early EOF can leave usage
+unknown even when the provider consumed tokens. Reported counters on failed or
+partial calls are still included in known totals, not claimed as full billing.
+
+**Limitations:** routing classifier/helper calls are excluded. Ensemble and IO
+profile requests are labelled `auxiliary_unaccounted`, with unknown totals rather
+than misleading synthetic zeros or partial fan-out sums. This is request-level
+accounting, not a provider invoice. Requests killed by process termination before
+finalization are not saved; live in-flight requests appear only when finalized.
+Adapter counters may themselves omit provider work. Compare with your provider's
+usage/billing page when investigating credits burned by interrupted calls.
+
 ## Development checks
 
 ```bash
