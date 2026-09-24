@@ -17,6 +17,26 @@ def claude_enabled(monkeypatch):
     monkeypatch.setattr(claude, "_auth_probe_cache", None)
 
 
+def test_workspace_is_stable_private_and_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(claude.Path, "home", lambda: tmp_path)
+    with claude.claude_request_workspace() as first:
+        pass
+    with claude.claude_request_workspace() as second:
+        assert first == second
+        assert claude.Path(second).stat().st_mode & 0o777 == 0o700
+        assert list(claude.Path(second).iterdir()) == []
+
+
+def test_workspace_rejects_symlink(tmp_path, monkeypatch):
+    monkeypatch.setattr(claude.Path, "home", lambda: tmp_path)
+    parent = tmp_path / ".codex-shim"
+    parent.mkdir()
+    (parent / "claude-workspace").symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(OSError):
+        with claude.claude_request_workspace():
+            pass
+
+
 def test_auth_cache_disable_and_config(monkeypatch, claude_enabled):
     calls = []
     def run(argv, **kwargs):

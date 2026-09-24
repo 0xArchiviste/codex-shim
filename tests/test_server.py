@@ -419,6 +419,7 @@ async def test_streaming_anthropic_response_completed_includes_usage():
                 "usage": {
                     "input_tokens": 5,
                     "cache_read_input_tokens": 4,
+                    "cache_creation_input_tokens": 2,
                     "output_tokens": 1,
                 }
             },
@@ -437,12 +438,13 @@ async def test_streaming_anthropic_response_completed_includes_usage():
     events = _sse_events(b"".join(downstream.chunks).decode())
     completed = [event for event in events if event.get("type") == "response.completed"][-1]
     assert completed["response"]["usage"] == {
-        "input_tokens": 5,
+        "input_tokens": 11,
         "output_tokens": 3,
-        "total_tokens": 8,
+        "total_tokens": 14,
         "input_tokens_details": {
             "cached_tokens": 4,
             "cache_read_input_tokens": 4,
+            "cache_creation_input_tokens": 2,
         },
     }
 

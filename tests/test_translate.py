@@ -11,6 +11,7 @@ from codex_shim.translate import (
     chat_to_anthropic,
     chat_to_responses_request,
     clamp_responses_id,
+    normalize_responses_usage,
     response_to_anthropic_message,
     response_to_chat_completion,
     responses_to_anthropic,
@@ -473,15 +474,76 @@ def test_anthropic_to_response_normalizes_cache_usage():
     out = anthropic_to_response(payload, "slug")
 
     assert out["usage"] == {
-        "input_tokens": 10,
+        "input_tokens": 20,
         "output_tokens": 3,
-        "total_tokens": 13,
+        "total_tokens": 23,
         "input_tokens_details": {
             "cached_tokens": 8,
             "cache_read_input_tokens": 8,
             "cache_creation_input_tokens": 2,
         },
     }
+
+
+def test_claude_usage_survives_responses_chat_and_anthropic_round_trip():
+    raw_usage = {
+        "input_tokens": 10,
+        "cache_read_input_tokens": 80,
+        "cache_creation_input_tokens": 20,
+        "output_tokens": 3,
+    }
+    usage = normalize_responses_usage(raw_usage)
+    assert usage["input_tokens"] == 110
+    assert usage["total_tokens"] == 113
+    assert normalize_responses_usage(usage) == usage
+    response = {"id": "resp_test", "output": [], "usage": usage}
+    chat = response_to_chat_completion(response, "slug")
+    assert chat["usage"] == {
+        "prompt_tokens": 110,
+        "completion_tokens": 3,
+        "total_tokens": 113,
+        "prompt_tokens_details": {
+            "cached_tokens": 80,
+            "cache_read_input_tokens": 80,
+            "cache_creation_input_tokens": 20,
+        },
+    }
+    assert chat_completion_to_response(chat, "slug")["usage"] == usage
+    assert response_to_anthropic_message(response, "slug")["usage"] == raw_usage
+    assert chat_completion_to_anthropic_message(chat, "slug")["usage"] == raw_usage
+
+
+def test_native_openai_usage_preserves_inclusive_totals_and_all_details():
+    native = {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "total_tokens": 120,
+        "input_tokens_details": {"cached_tokens": 80, "audio_tokens": 5},
+        "output_tokens_details": {"reasoning_tokens": 10, "audio_tokens": 2},
+    }
+    assert normalize_responses_usage(native) == native
+    chat = response_to_chat_completion({"output": [], "usage": native}, "slug")
+    assert chat["usage"]["prompt_tokens"] == 100
+    assert chat["usage"]["prompt_tokens_details"] == native["input_tokens_details"]
+    assert chat_completion_to_response(chat, "slug")["usage"] == native
+    anthropic = response_to_anthropic_message({"output": [], "usage": native}, "slug")
+    assert anthropic["usage"] == {
+        "input_tokens": 20, "cache_read_input_tokens": 80, "output_tokens": 20,
+    }
+    assert anthropic_to_response(anthropic, "slug")["usage"]["input_tokens"] == 100
+
+
+def test_cache_only_usage_counts_reads_and_writes_without_double_counting():
+    for raw, expected in [
+        ({"input_tokens": 0, "cache_read_input_tokens": 8, "output_tokens": 2}, 8),
+        ({"input_tokens": 0, "cache_creation_input_tokens": 8, "output_tokens": 2}, 8),
+        ({"cache_read_input_tokens": 8, "cache_creation_input_tokens": 2, "output_tokens": 2}, 10),
+        ({"input_tokens": 8, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 2}, 8),
+    ]:
+        normalized = normalize_responses_usage(raw)
+        assert normalized["input_tokens"] == expected
+        assert normalized["total_tokens"] == expected + 2
+        assert normalize_responses_usage(normalized) == normalized
 
 
 def test_chat_to_responses_request_converts_messages_tools_and_images():

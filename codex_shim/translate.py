@@ -579,7 +579,22 @@ def normalize_responses_usage(usage: Any) -> dict[str, Any] | None:
     if output_tokens is None:
         output_tokens = _int_token(usage.get("completion_tokens"))
 
+    # Anthropic input_tokens excludes both cache reads and cache writes. OpenAI
+    # input/prompt totals already include caches, whose counters live in details.
+    # Only expand raw Anthropic usage, so normalization is also idempotent.
+    cache_read = _int_token(usage.get("cache_read_input_tokens"))
+    cache_created = _int_token(usage.get("cache_creation_input_tokens"))
+    anthropic_usage = (
+        "prompt_tokens" not in usage
+        and "input_tokens_details" not in usage
+        and (cache_read is not None or cache_created is not None)
+    )
+    if anthropic_usage:
+        input_tokens = (input_tokens or 0) + (cache_read or 0) + (cache_created or 0)
+
     total_tokens = _int_token(usage.get("total_tokens"))
+    if anthropic_usage:
+        total_tokens = None
     if total_tokens is None and input_tokens is not None and output_tokens is not None:
         total_tokens = input_tokens + output_tokens
 
@@ -602,11 +617,9 @@ def normalize_responses_usage(usage: Any) -> dict[str, Any] | None:
     if isinstance(usage.get("prompt_tokens_details"), dict):
         input_details.update(usage["prompt_tokens_details"])
 
-    cache_read = _int_token(usage.get("cache_read_input_tokens"))
     if cache_read is not None:
         input_details.setdefault("cached_tokens", cache_read)
         input_details.setdefault("cache_read_input_tokens", cache_read)
-    cache_created = _int_token(usage.get("cache_creation_input_tokens"))
     if cache_created is not None:
         input_details.setdefault("cache_creation_input_tokens", cache_created)
 
@@ -1224,7 +1237,9 @@ def _responses_usage_to_chat_usage(usage: dict[str, Any] | None) -> dict[str, An
     }
     input_details = usage.get("input_tokens_details")
     if isinstance(input_details, dict):
-        prompt_details: dict[str, Any] = {}
+        # Keep provider-specific cache-write/read counters and native OpenAI
+        # details (for example audio_tokens), not just the cached-token alias.
+        prompt_details: dict[str, Any] = dict(input_details)
         cached = input_details.get("cached_tokens", input_details.get("cache_read_input_tokens"))
         if isinstance(cached, int) and not isinstance(cached, bool):
             prompt_details["cached_tokens"] = cached
@@ -1454,6 +1469,14 @@ def _responses_usage_to_anthropic_usage(usage: dict[str, Any] | None) -> dict[st
         cache_created = input_details.get("cache_creation_input_tokens")
         if isinstance(cache_created, int) and not isinstance(cache_created, bool):
             result["cache_creation_input_tokens"] = cache_created
+        # Convert the inclusive Responses total back to Anthropic's uncached
+        # input count; cache reads and writes are separate Anthropic buckets.
+        result["input_tokens"] = max(
+            result["input_tokens"]
+            - result.get("cache_read_input_tokens", 0)
+            - result.get("cache_creation_input_tokens", 0),
+            0,
+        )
     return result
 
 

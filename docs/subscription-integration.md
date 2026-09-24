@@ -251,6 +251,34 @@ working directory and disabled tools are not an OS sandbox.
 Model identifiers must be checked against the installed CLI/account before
 advertising a deployment as verified.
 
+### Cache efficiency and call cost
+
+Claude requests use a stable, private `~/.codex-shim/claude-workspace`
+working directory. Random per-request paths can change the CLI-generated
+prompt prefix and defeat provider prompt caching. Tools, project settings,
+hooks, and session persistence remain disabled; a stable cwd does not mean
+sharing conversation state or resuming sessions.
+
+A small Opus 5.5 repeat-prompt check on 2026-09-24 measured zero cache reads
+with random working directories. With the stable directory, the first call
+wrote 2,248 cache tokens and the second read 2,248 with no new cache writes.
+This is evidence for that prompt/account, not a guaranteed hit rate or billing
+savings estimate. Cache eligibility, prefix stability, model, expiration, and
+provider policy still matter. Output tokens are not made free by input caching.
+
+For minimum call amplification, prefer a plain model alias. `cx-autogrok`
+runs two candidates plus adjudication; Jev IO can add relevance judging,
+rewriting, and recall rounds. These modes may save context tokens but are not
+a guaranteed cost reduction. No provider billing limit is enforced by this
+shim; use account-side spending controls where available.
+
+Usage reporting is not a billing ledger: ensemble responses currently report
+zero usage rather than aggregating candidate/adjudicator calls, and auxiliary
+Jev/router calls are not guaranteed to be included in the returned model usage.
+Failures can consume tokens before usage is returned. Client or CLI retries
+can also repeat work. Consult provider usage for actual account consumption;
+never interpret a zero or missing usage field as a free request.
+
 ### UltraCode scope
 
 [claude-shim](https://github.com/petr-korobeinikov/claude-shim) provides useful

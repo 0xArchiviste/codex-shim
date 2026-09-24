@@ -13,6 +13,8 @@ import shutil
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
+from pathlib import Path
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -180,12 +182,27 @@ class ClaudeStreamParser:
         return delta
 
 
+@contextmanager
+def claude_request_workspace():
+    """Stable private cwd avoids random paths changing the CLI prompt prefix.
+
+    No conversation is persisted here; request isolation comes from disabled
+    tools/settings and separate non-persistent CLI sessions, not a random path.
+    """
+    path = Path.home() / ".codex-shim" / "claude-workspace"
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.is_symlink() or path.stat().st_uid != os.getuid():
+        raise OSError("Claude workspace must be a user-owned directory")
+    path.chmod(0o700)
+    yield str(path)
+
+
 async def iter_claude_agent_events(prompt: str, slug: str) -> AsyncIterator[dict[str, Any]]:
     """Run an isolated text-only turn. Closing/cancelling the iterator kills the child."""
     proc = None
     stderr_task = None
     parser = ClaudeStreamParser()
-    with tempfile.TemporaryDirectory(prefix="codex-shim-claude-") as cwd:
+    with claude_request_workspace() as cwd:
         try:
             argv = [claude_bin(), "--print", "--output-format", "stream-json", "--verbose",
                     "--include-partial-messages", "--no-session-persistence", "--disable-slash-commands", "--tools", "",
