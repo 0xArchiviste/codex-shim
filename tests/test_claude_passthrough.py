@@ -93,6 +93,11 @@ def test_unsupported_requests(body):
         claude.build_claude_prompt(body)
 
 
+def test_permission_control_response_ignores_model_output():
+    assert claude.permission_control_response({"type": "assistant", "message": {}}) is None
+    assert claude.permission_control_response({"type": "control_request", "request_id": "", "request": {"subtype": "can_use_tool"}}) is None
+
+
 def test_parser_deduplicates():
     parser = claude.ClaudeStreamParser()
     assert parser.feed_line(json.dumps({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hello"}}})) == "Hello"
@@ -106,16 +111,19 @@ class FakeProc:
         self.returncode = None
         self.killed = False
         self.stdout = asyncio.StreamReader()
-        for line in lines:
+        handshake = {"type": "control_response", "response": {"subtype": "success", "request_id": "req_init", "response": {}}}
+        for line in (handshake, *lines):
             self.stdout.feed_data(json.dumps(line).encode() + b"\n")
         self.stdout.feed_eof()
         self.stderr = asyncio.StreamReader()
         self.stderr.feed_eof()
         self.stdin = self
         self.data = None
+        self.writes = []
 
     def write(self, data):
-        self.data = data
+        self.writes.append(data)
+        self.data = b"".join(self.writes)
 
     async def drain(self):
         pass
@@ -143,12 +151,63 @@ async def test_spawn_flags_stdin_effort_and_cleanup(monkeypatch):
     events = [event async for event in claude.iter_claude_agent_events("private prompt", "cd-fable-high")]
     argv = captured["argv"]
     assert argv[argv.index("--tools") + 1] == ""
+    assert argv[argv.index("--permission-prompts") + 1] == "host"
+    assert argv[argv.index("--input-format") + 1] == "stream-json"
+    assert "--permission-mode" not in argv
     assert argv[argv.index("--effort") + 1] == "high"
     assert "--no-session-persistence" in argv and "--strict-mcp-config" in argv
-    assert "private prompt" not in argv and proc.data == b"private prompt"
+    sent = next(json.loads(item) for item in proc.writes if json.loads(item).get("type") == "user")
+    assert sent["message"]["content"] == "private prompt" and "private prompt" not in argv
     assert "shell" not in captured["kwargs"]
     assert events[-1] == {"type": "completed", "text": "Hello"}
     assert not proc.killed
+
+
+async def test_host_permission_request_is_explicitly_allowed(monkeypatch):
+    tool_input = {"command": "echo hi"}
+    proc = FakeProc([
+        {"type": "control_request", "request_id": "req_1", "request": {"subtype": "can_use_tool", "tool_name": "Bash", "input": tool_input, "tool_use_id": "tu_1"}},
+        {"type": "control_request", "request_id": "req_2", "request": {"subtype": "hook_callback", "callback_id": "hook_1", "input": {}}},
+        {"type": "result", "subtype": "success", "result": "ok"},
+    ])
+    async def spawn(*argv, **kwargs):
+        return proc
+    monkeypatch.setattr(claude.asyncio, "create_subprocess_exec", spawn)
+    events = [event async for event in claude.iter_claude_agent_events("prompt", "cd-opus-5-5-medium")]
+    parsed = [json.loads(item) for item in proc.writes]
+    allow = next(item for item in parsed if item.get("response", {}).get("response", {}).get("behavior") == "allow")
+    rejected = next(item for item in parsed if item.get("response", {}).get("subtype") == "error")
+    assert allow == {"type": "control_response", "response": {"subtype": "success", "request_id": "req_1", "response": {"behavior": "allow", "updatedInput": tool_input}}}
+    assert rejected["response"]["subtype"] == "error" and rejected["response"]["request_id"] == "req_2"
+    assert "echo hi" not in rejected["response"]["error"]
+    assert events[-1] == {"type": "completed", "text": "ok"}
+
+
+async def test_result_closes_stdin_so_the_cli_can_exit(monkeypatch):
+    proc = FakeProc([{"type": "result", "subtype": "success", "result": "ok"}])
+    proc.stdout = asyncio.StreamReader()
+    proc.closed = False
+    for line in (
+        {"type": "control_response", "response": {"subtype": "success", "request_id": "req_init", "response": {}}},
+        {"type": "result", "subtype": "success", "result": "ok"},
+    ):
+        proc.stdout.feed_data(json.dumps(line).encode() + b"\n")
+
+    def close():
+        proc.closed = True
+        proc.stdout.feed_eof()
+
+    proc.close = close
+    async def spawn(*argv, **kwargs):
+        return proc
+    monkeypatch.setattr(claude.asyncio, "create_subprocess_exec", spawn)
+
+    async def collect():
+        return [event async for event in claude.iter_claude_agent_events("prompt", "cd-opus-5-5-medium")]
+
+    events = await asyncio.wait_for(collect(), 2)
+    assert proc.closed
+    assert events[-1] == {"type": "completed", "text": "ok"}
 
 
 async def test_cancellation_cleans_child(monkeypatch):

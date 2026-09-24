@@ -48,8 +48,24 @@ running deployment instead of assuming it.
   Claude desktop and Claude Code CLI are different executables; a desktop
   process is not evidence of CLI login or model entitlement.
 - Never extract desktop credentials or copy OAuth tokens into repository files.
-- Keep local tools disabled for the text-only adapter. Reject unsupported
-  client tool requests explicitly; do not turn them into host-side execution.
+- Speak stream-json on both stdin and stdout. Send the `initialize` control
+  request before the user message, and leave stdin open until the result
+  event. Closing it earlier drops permission replies; leaving it open after
+  the result prevents the CLI from exiting.
+- Permission prompts are answered by the host. A `can_use_tool` request gets
+  an explicit allow with `updatedInput` set to the original input. Do not
+  switch that answer to deny, `--permission-prompts none`, or
+  `--permission-mode dontAsk`. Other control-request subtypes get a control
+  error so the turn does not wait.
+- Client tools still belong to the caller. Return one `codex-shim-tool` fence
+  as function calls. Accept surrounding prose, a function wrapper, JSON-string
+  arguments, and extra keys; reject schema-invalid arguments. Do not execute
+  those client tools on the shim host. The CLI's own tool list stays empty.
+- Put the tool-definition block before the growing conversation so that prefix
+  can be cached. Do not put a changing timestamp or random id in front of it.
+- Logs may contain fixed codes only: allowed permission, stream error code,
+  and rejected tool reply. Never log prompts, tool inputs, stderr, or
+  credentials.
 - Verify authentication and a live model response before claiming a `cd-*`
   deployment works. Unit tests with fake CLI output are not entitlement checks.
 - UltraCode workflow support requires separate tool protocol validation; adding

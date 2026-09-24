@@ -16,7 +16,7 @@ from referencing import Registry
 from referencing.exceptions import NoSuchResource
 
 _FENCE = "codex-shim-tool"
-_REPLY = re.compile(r"\s*```codex-shim-tool[^\S\r\n]*\r?\n(.*?)\r?\n```\s*", re.DOTALL)
+_BLOCK = re.compile(r"```codex-shim-tool[^\S\r\n]*\r?\n(.*?)\r?\n```", re.DOTALL)
 
 
 def _deny_remote(uri: str):
@@ -125,9 +125,9 @@ def validate_claude_tool_reply(text: str, body: dict[str, Any]) -> list[dict[str
         raise ValueError("Invalid Claude parallel tool policy")
     if not isinstance(text, str):
         raise ValueError("Invalid Claude reply")
-    match = _REPLY.fullmatch(text)
-    if not match:
-        if _FENCE in text:
+    matches = list(_BLOCK.finditer(text))
+    if len(matches) != 1:
+        if _FENCE in text or matches:
             raise ValueError("Malformed Claude tool reply")
         if choice == "required":
             raise ValueError("Claude reply omitted a required tool call")
@@ -135,7 +135,7 @@ def validate_claude_tool_reply(text: str, body: dict[str, Any]) -> list[dict[str
     if choice == "none":
         raise ValueError("Claude tool calls are disabled")
     try:
-        payload = json.loads(match.group(1), parse_constant=_reject_constant, object_pairs_hook=_unique_object)
+        payload = json.loads(matches[0].group(1), parse_constant=_reject_constant, object_pairs_hook=_unique_object)
         if not isinstance(payload, dict) or set(payload) != {"tool_calls"} or not _finite(payload):
             raise ValueError
         rows = payload["tool_calls"]
@@ -143,12 +143,15 @@ def validate_claude_tool_reply(text: str, body: dict[str, Any]) -> list[dict[str
             raise ValueError
         calls = []
         for row in rows:
-            if not isinstance(row, dict) or set(row) != {"name", "arguments"}:
+            if not isinstance(row, dict):
                 raise ValueError
-            name, arguments = row["name"], row["arguments"]
+            fn = row.get("function") if isinstance(row.get("function"), dict) else row
+            name, arguments = fn.get("name"), fn.get("arguments")
+            if isinstance(arguments, str):
+                arguments = json.loads(arguments, parse_constant=_reject_constant, object_pairs_hook=_unique_object)
             if not isinstance(name, str) or name not in definitions or (forced is not None and name != forced):
                 raise ValueError
-            if not isinstance(arguments, dict):
+            if not isinstance(arguments, dict) or not _finite(arguments):
                 raise ValueError
             _validator(definitions[name]["parameters"]).validate(arguments)
             calls.append({"name": name, "arguments": json.dumps(arguments, sort_keys=True, ensure_ascii=False, allow_nan=False)})

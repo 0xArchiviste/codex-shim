@@ -936,6 +936,7 @@ class ShimServer:
                     telemetry.observe(event)
                     kind = event["type"]
                     if kind == "error":
+                        print(f"[claude] stream error code={event.get('code')}", flush=True)
                         error = {"type": "upstream_error", "code": event.get("code"), "message": event["message"]}
                         failure = {"error": error}
                         if usage is not None:
@@ -965,6 +966,7 @@ class ShimServer:
         try:
             tool_calls = validate_claude_tool_reply(text, body)
         except ValueError as exc:
+            print(f"[claude] rejected tool reply: {exc}", flush=True)
             failure = {"error": {"type": "upstream_error", "code": "claude_tool_protocol_error", "message": str(exc)}}
             if usage is not None:
                 failure["usage"] = usage

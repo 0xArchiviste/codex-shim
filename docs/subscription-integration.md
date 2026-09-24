@@ -234,12 +234,21 @@ and refresh. Verify the selected CLI's login before enabling it in the daemon.
 Interactive sessions must never be resumed or reused by API requests.
 
 The adapter supports Chat Completions and Responses, including client tool
-definitions and prior tool results. It asks Claude to emit a fenced tool-call
-block, which the shim returns to the client for execution. Claude's own local
-tools stay disabled, so the shim host does not run the client's tools.
-Anthropic Messages, Responses compaction, images, structured-output formats,
-and implicit prior-response history remain unsupported. No Claude Jev IO
-profiles are added.
+definitions and prior tool results. Tool definitions are placed before the
+conversation. Claude is asked to emit one `codex-shim-tool` fence, which the
+shim returns to the client for execution. A valid fence is accepted with
+surrounding prose, a function wrapper, arguments encoded as a JSON string, and
+extra keys. Schema-invalid arguments are rejected and are not executed.
+Claude's built-in tool list stays empty (`--tools ""`).
+
+The CLI is started with `--input-format stream-json` and
+`--permission-prompts host`. The shim sends an `initialize` control request,
+then the user message, and keeps stdin open. When Claude asks the host for
+permission (`can_use_tool`), the shim replies with an explicit allow and the
+original input. Any other control request is rejected. Stdin is closed after
+the result event so the process can exit. Anthropic Messages, Responses
+compaction, images, structured-output formats, and implicit prior-response
+history remain unsupported. No Claude Jev IO profiles are added.
 
 `CODEX_SHIM_DISABLE_CLAUDE=1` disables discovery and routing. To correct model
 IDs for your account, set `CODEX_SHIM_CLAUDE_MODEL_OVERRIDES` to a JSON object

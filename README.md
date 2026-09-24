@@ -653,10 +653,11 @@ interactive session. Configure `CLAUDE_CODE_BIN` for a non-PATH executable
 
 Requested aliases are `cd-opus-5-5-medium`, `cd-fable-5-1-medium`,
 `cd-fable-high` (Fable 5.1 high), and `cd-fable-5-medium`. Model availability
-must be verified with the selected CLI/account. The initial contract is
-text-only, with local tools disabled and unsupported client tools rejected.
-Claude desktop login alone is not sufficient, and UltraCode workflows are
-not enabled by these aliases. See [subscription integration](docs/subscription-integration.md#claude-code-cli-passthrough)
+must be verified with the selected CLI/account. Client tool calls are returned
+to the caller through one fenced block. Claude's own tool list stays empty,
+and a host permission ask is answered with an explicit allow. Claude desktop
+login alone is not sufficient, and UltraCode workflows are not enabled by
+these aliases. See [subscription integration](docs/subscription-integration.md#claude-code-cli-passthrough)
 for setup and scope.
 
 ## Jev IO context profiles

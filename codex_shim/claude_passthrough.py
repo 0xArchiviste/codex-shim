@@ -137,6 +137,19 @@ def build_claude_prompt(body: dict[str, Any]) -> str:
     validate(body.get("messages"))
     chat = responses_to_chat(body, str(body.get("model") or ""))
     sections = []
+    tools = body.get("tools") or []
+    if tools:
+        from .claude_tools import render_claude_tool_definitions
+        choice = body.get("tool_choice") or chat.get("tool_choice") or "auto"
+        sections.append(
+            "[AVAILABLE CLIENT TOOLS]\n"
+            + render_claude_tool_definitions(body)
+            + f"\n\nTool choice: {json.dumps(choice, sort_keys=True)}\n"
+            + "Do not execute tools yourself. When a client tool is required, reply with only this fence:\n"
+            + f"```{_TOOL_FENCE}\n"
+            + '{"tool_calls":[{"name":"tool_name","arguments":{}}]}\n'
+            + "```\nOtherwise answer in normal text and do not emit that fence."
+        )
     for message in chat.get("messages", []):
         content = message.get("content") or ""
         if isinstance(content, list):
@@ -155,22 +168,6 @@ def build_claude_prompt(body: dict[str, Any]) -> str:
             if label == "TOOL":
                 label = f"TOOL {message.get('tool_call_id', '')}"
             sections.append(f"[{label}]\n{content}")
-    # This text bridge has no upstream tool-name restrictions. Keep the exact
-    # client name, not the OpenAI-sanitized name from responses_to_chat().
-    tools = body.get("tools") or []
-    if tools:
-        from .claude_tools import render_claude_tool_definitions
-        rendered = render_claude_tool_definitions(body)
-        choice = body.get("tool_choice") or chat.get("tool_choice") or "auto"
-        sections.append(
-            "[AVAILABLE CLIENT TOOLS]\n"
-            + rendered
-            + f"\n\nTool choice: {json.dumps(choice, sort_keys=True)}\n"
-            + "Do not execute tools yourself. When a client tool is required, reply with only this fence:\n"
-            + f"```{_TOOL_FENCE}\n"
-            + '{"tool_calls":[{"name":"tool_name","arguments":{}}]}\n'
-            + "```\nOtherwise answer in normal text and do not emit that fence."
-        )
     return "\n\n".join(sections) or "Continue."
 
 
@@ -194,6 +191,22 @@ def parse_claude_tool_calls(text: str, allowed_names: set[str]) -> list[dict[str
                 return []
             calls.append({"name": row["name"], "arguments": json.dumps(arguments, sort_keys=True)})
     return calls
+
+
+def permission_control_response(message: dict[str, Any]) -> dict[str, Any] | None:
+    """Answer a host permission ask with an explicit allow. Other control requests are rejected."""
+    if message.get("type") != "control_request":
+        return None
+    request_id = message.get("request_id")
+    request = message.get("request")
+    if not isinstance(request_id, str) or not request_id or not isinstance(request, dict):
+        return None
+    if request.get("subtype") == "can_use_tool":
+        updated = request.get("input")
+        if not isinstance(updated, dict):
+            updated = {}
+        return {"type": "control_response", "response": {"subtype": "success", "request_id": request_id, "response": {"behavior": "allow", "updatedInput": updated}}}
+    return {"type": "control_response", "response": {"subtype": "error", "request_id": request_id, "error": "Unsupported control request"}}
 
 
 def claude_tool_names(body: dict[str, Any]) -> set[str]:
@@ -304,12 +317,14 @@ async def iter_claude_agent_events(prompt: str, slug: str) -> AsyncIterator[dict
     """Run an isolated text-only turn. Closing/cancelling the iterator kills the child."""
     proc = None
     stderr_task = None
+    reader = None
     parser = ClaudeStreamParser()
     emitted_usage = None
     with claude_request_workspace() as cwd:
         try:
             argv = [claude_bin(), "--print", "--output-format", "stream-json", "--verbose",
                     "--include-partial-messages", "--no-session-persistence", "--disable-slash-commands", "--tools", "",
+                    "--input-format", "stream-json", "--permission-prompts", "host",
                     "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
                     "--setting-sources", "", "--settings", '{"disableAllHooks":true}',
                     "--model", claude_upstream_model(slug), "--effort", CLAUDE_MODEL_ALIASES[slug][1]]
@@ -322,22 +337,80 @@ async def iter_claude_agent_events(prompt: str, slug: str) -> AsyncIterator[dict
                     while await proc.stderr.read(8192):
                         pass  # Never return diagnostics that might contain credentials.
                 stderr_task = asyncio.create_task(drain_stderr())
-                proc.stdin.write(prompt.encode("utf-8"))
+                events: asyncio.Queue = asyncio.Queue()
+                init_future = asyncio.get_running_loop().create_future()
+
+                async def read_stdout() -> None:
+                    nonlocal emitted_usage
+                    try:
+                        while raw := await proc.stdout.readline():
+                            if not raw.strip():
+                                continue
+                            try:
+                                incoming = json.loads(raw)
+                            except json.JSONDecodeError:
+                                incoming = None
+                            if isinstance(incoming, dict) and incoming.get("type") == "control_response":
+                                response = incoming.get("response")
+                                if isinstance(response, dict) and response.get("request_id") == "req_init" and not init_future.done():
+                                    init_future.set_result(response.get("subtype") == "success")
+                                continue
+                            if isinstance(incoming, dict):
+                                reply = permission_control_response(incoming)
+                                if reply is not None:
+                                    if reply["response"].get("subtype") == "success":
+                                        print("[claude] allowed host permission request", flush=True)
+                                    proc.stdin.write((json.dumps(reply, ensure_ascii=False) + "\n").encode())
+                                    await proc.stdin.drain()
+                                    continue
+                            delta = parser.feed_line(raw.decode("utf-8"))
+                            if parser.usage is not None and parser.usage != emitted_usage:
+                                emitted_usage = dict(parser.usage)
+                                await events.put({"type": "usage", "usage": emitted_usage})
+                            if parser.error and parser.result_seen:
+                                await events.put({"type": "error", "code": parser.error_code, "message": parser.error})
+                                return
+                            if delta and not parser.error:
+                                await events.put({"type": "text_delta", "delta": delta})
+                            # The CLI keeps stdout open until stdin closes, but only after the result.
+                            if parser.result_seen:
+                                proc.stdin.close()
+                        await events.put({"type": "_eof"})
+                    except asyncio.CancelledError:
+                        raise
+                    except TimeoutError:
+                        await events.put({"type": "error", "code": "claude_timeout", "message": "Claude Code request timed out"})
+                        await events.put({"type": "_eof"})
+                    except (OSError, ValueError, UnicodeError, TypeError, AttributeError):
+                        await events.put({"type": "error", "code": "claude_process_error", "message": "Unable to execute Claude Code or parse its output"})
+                        await events.put({"type": "_eof"})
+                    finally:
+                        if not init_future.done():
+                            init_future.set_result(False)
+
+                reader = asyncio.create_task(read_stdout())
+                # The CLI accepts permission replies only after this handshake, with stdin left open.
+                initialize = {"type": "control_request", "request_id": "req_init", "request": {"subtype": "initialize", "hooks": None}}
+                proc.stdin.write((json.dumps(initialize) + "\n").encode())
                 await proc.stdin.drain()
-                proc.stdin.close()
-                while raw := await proc.stdout.readline():
-                    if not raw.strip():
-                        continue
-                    delta = parser.feed_line(raw.decode("utf-8"))
-                    if parser.usage is not None and parser.usage != emitted_usage:
-                        emitted_usage = dict(parser.usage)
-                        yield {"type": "usage", "usage": emitted_usage}
-                    # Error envelopes may precede the billable result: drain safely.
-                    if parser.error and parser.result_seen:
-                        yield {"type": "error", "code": parser.error_code, "message": parser.error}
+                try:
+                    initialized = await asyncio.wait_for(init_future, 30)
+                except TimeoutError:
+                    initialized = False
+                if not initialized:
+                    yield {"type": "error", "code": "claude_process_error", "message": "Claude Code control handshake failed"}
+                    return
+                user_message = {"type": "user", "session_id": "", "message": {"role": "user", "content": prompt}, "parent_tool_use_id": None}
+                proc.stdin.write((json.dumps(user_message, ensure_ascii=False) + "\n").encode())
+                await proc.stdin.drain()
+                while True:
+                    event = await events.get()
+                    if event["type"] == "_eof":
+                        break
+                    yield event
+                    if event["type"] == "error":
                         return
-                    if delta and not parser.error:
-                        yield {"type": "text_delta", "delta": delta}
+                proc.stdin.close()
                 code = await proc.wait()
                 if parser.error:
                     yield {"type": "error", "code": parser.error_code, "message": parser.error}
@@ -355,12 +428,20 @@ async def iter_claude_agent_events(prompt: str, slug: str) -> AsyncIterator[dict
         except (OSError, ValueError, UnicodeError, TypeError, AttributeError):
             yield {"type": "error", "code": "claude_process_error", "message": "Unable to execute Claude Code or parse its output"}
         finally:
+            if proc is not None and proc.stdin is not None:
+                try:
+                    proc.stdin.close()
+                except (AttributeError, RuntimeError, OSError):
+                    pass
             if proc is not None and proc.returncode is None:
                 try:
                     proc.kill()
                 except ProcessLookupError:
                     pass
                 await proc.wait()
+            if reader is not None:
+                reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
             if stderr_task is not None:
                 stderr_task.cancel()
                 await asyncio.gather(stderr_task, return_exceptions=True)

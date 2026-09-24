@@ -91,7 +91,7 @@ def test_none_forced_and_parallel_policy():
         validate_claude_tool_reply(reply(rows=rows), body(parallel_tool_calls=False))
 
 
-@pytest.mark.parametrize("text", ["```codex-shim-tool\n{", "prefix " + reply(), reply() + " suffix", reply(rows=[]), reply(name="Unknown"), '```codex-shim-tool\nnot json\n```'])
+@pytest.mark.parametrize("text", ["```codex-shim-tool\n{", reply(rows=[]), reply(name="Unknown"), '```codex-shim-tool\nnot json\n```'])
 def test_malformed_attempt_is_not_prose(text):
     with pytest.raises(ValueError):
         validate_claude_tool_reply(text, body())
@@ -132,6 +132,12 @@ def test_safe_errors_hide_private_arguments():
         validate_claude_tool_reply(reply({"pattern": "private-secret", "unknown": 1}), body())
     assert "private-secret" not in str(caught.value)
     assert "unknown" not in str(caught.value)
+
+
+def test_common_model_tool_formats():
+    assert validate_claude_tool_reply("I need to search.\n" + reply() + "\nDone.", body())
+    encoded = reply(rows=[{"id": "call_1", "name": "Grep", "arguments": json.dumps({"pattern": "handler"})}])
+    assert json.loads(validate_claude_tool_reply(encoded, body())[0]["arguments"]) == {"pattern": "handler"}
 
 
 def test_duplicate_names_and_unsupported_native_tools():
