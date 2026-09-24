@@ -40,6 +40,21 @@ shim, agents should preserve the current endpoint and credentials:
 The current reverse-BYOK convention uses port `8766`, but always inspect the
 running deployment instead of assuming it.
 
+## Claude Code transport safety
+
+- API requests must start isolated headless CLI sessions, never attach to or
+  resume the user's interactive Claude session.
+- Use an explicit executable/profile when crossing WSL/Windows boundaries.
+  Claude desktop and Claude Code CLI are different executables; a desktop
+  process is not evidence of CLI login or model entitlement.
+- Never extract desktop credentials or copy OAuth tokens into repository files.
+- Keep local tools disabled for the text-only adapter. Reject unsupported
+  client tool requests explicitly; do not turn them into host-side execution.
+- Verify authentication and a live model response before claiming a `cd-*`
+  deployment works. Unit tests with fake CLI output are not entitlement checks.
+- UltraCode workflow support requires separate tool protocol validation; adding
+  model aliases alone does not provide Claude Code's orchestration runtime.
+
 ## What kinds of changes are useful
 
 - Translation fixes for tricky tool-call / reasoning streams, with a

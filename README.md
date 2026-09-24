@@ -643,6 +643,22 @@ GLM, etc.) round-trip through `reasoning.encrypted_content` items.
 
 ---
 
+## Claude Code subscription adapter
+
+The `cd-*` transport is separate from Cursor's `cx-*` models. It launches
+isolated Claude Code CLI requests using the CLI's login, without resuming an
+interactive session. Configure `CLAUDE_CODE_BIN` for a non-PATH executable
+(including a native Windows CLI from WSL) and optionally
+`CODEX_SHIM_CLAUDE_CONFIG_DIR` for a trusted profile.
+
+Requested aliases are `cd-opus-5-5-medium`, `cd-fable-5-1-medium`,
+`cd-fable-high` (Fable 5.1 high), and `cd-fable-5-medium`. Model availability
+must be verified with the selected CLI/account. The initial contract is
+text-only, with local tools disabled and unsupported client tools rejected.
+Claude desktop login alone is not sufficient, and UltraCode workflows are
+not enabled by these aliases. See [subscription integration](docs/subscription-integration.md#claude-code-cli-passthrough)
+for setup and scope.
+
 ## Jev IO context profiles
 
 Jev IO is an opt-in, reversible context layer for large Read/Bash/Grep results.
@@ -659,6 +675,7 @@ Cursor aliases use the local `cursor-agent` OAuth session:
 - `cx-fable-5-1` / `cx-fable-5-1-high`
 - `cx-fable-5` / `cx-fable-5-high`
 - `cx-opus-5` → Opus 5 High Thinking
+- `cx-opus-5-5` → Opus 5.5
 - `cx-sol-5-6` / `cx-sol-5-6-high`
 
 For example, Fable 5.1 exposes `cx-fable-5-1`,

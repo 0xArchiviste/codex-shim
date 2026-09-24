@@ -118,6 +118,9 @@ def write_catalog(models: list[ShimModel], path: Path, router_config=None, ensem
                 slug == "composer-2-5" and not chatgpt_passthrough_available()
             )
             entries.append(entry)
+    from .claude_passthrough import claude_catalog_entry, claude_passthrough_available, claude_passthrough_display_names
+    if claude_passthrough_available():
+        entries.extend(claude_catalog_entry(slug) for slug in claude_passthrough_display_names())
     entries.extend(catalog_entry(model) for model in usable_byok_models(models))
     if ensemble_mixes:
         from . import ensemble as ensemble_module

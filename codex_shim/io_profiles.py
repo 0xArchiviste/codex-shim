@@ -24,6 +24,7 @@ CURSOR_IO_BASES: tuple[tuple[str, str], ...] = (
     ("cx-fable-5", "Cursor Fable 5 Medium"),
     ("cx-fable-5-high", "Cursor Fable 5 High"),
     ("cx-opus-5", "Cursor Opus 5 High Thinking"),
+    ("cx-opus-5-5", "Cursor Opus 5.5"),
     ("cx-sol-5-6", "Cursor GPT-5.6 Sol Medium"),
     ("cx-sol-5-6-high", "Cursor GPT-5.6 Sol High"),
 )

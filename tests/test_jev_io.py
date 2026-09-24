@@ -53,6 +53,8 @@ def test_profiles_are_opt_in_and_configurable(tmp_path, monkeypatch):
         "cx-grok-4-7-jev-io-max",
         "cx-fable-5-1-jev-io",
         "cx-opus-5-jev-io-max",
+        "cx-opus-5-5-jev-io",
+        "cx-opus-5-5-jev-io-max",
         "cx-sol-5-6-high-jev-io",
         "cx-autogrok",
     } <= slugs

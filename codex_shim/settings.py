@@ -504,6 +504,9 @@ def default_model_slug(models: list[ShimModel], include_chatgpt: bool | None = N
         return usable[0].slug
     if cursor_passthrough_available():
         return CURSOR_MODEL_SLUG
+    from .claude_passthrough import claude_passthrough_available
+    if claude_passthrough_available():
+        return "cd-opus-5-5-medium"
     raise ValueError(
         "No usable codex-shim models: add models to ~/.codex-shim/models.json, run `codex login`, "
         "run `cursor-agent login`, or unset CODEX_SHIM_DISABLE_CHATGPT / CODEX_SHIM_DISABLE_CURSOR."
@@ -525,6 +528,9 @@ def available_model_slugs(models: list[ShimModel]) -> set[str]:
         slugs |= chatgpt_passthrough_slugs()
     if cursor_passthrough_available():
         slugs |= set(cursor_passthrough_display_names())
+    from .claude_passthrough import claude_passthrough_available, claude_passthrough_display_names
+    if claude_passthrough_available():
+        slugs |= set(claude_passthrough_display_names())
     return slugs
 
 

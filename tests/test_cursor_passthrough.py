@@ -27,6 +27,7 @@ def test_cursor_subscription_aliases_resolve_expected_models():
         "cx-fable-5": "claude-fable-5-medium",
         "cx-fable-5-high": "claude-fable-5-high",
         "cx-opus-5": "claude-opus-5-thinking-high",
+        "cx-opus-5-5": "claude-opus-5-5-medium",
         "cx-sol-5-6": "gpt-5.6-sol-medium",
         "cx-sol-5-6-high": "gpt-5.6-sol-high",
     }

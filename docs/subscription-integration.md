@@ -117,6 +117,7 @@ cx-fable-5-1-high
 cx-fable-5
 cx-fable-5-high
 cx-opus-5
+cx-opus-5-5
 cx-sol-5-6
 cx-sol-5-6-high
 ```
@@ -206,6 +207,60 @@ so a stale shell variable cannot override your CLI OAuth login.
   endpoints and generated catalog/config are refreshed.
 - If `CURSOR_AGENT_BIN` is set, verify it points to an executable
   `cursor-agent` binary.
+
+---
+
+## Claude Code CLI passthrough
+
+Claude Code passthrough uses a separately launched headless CLI request, not
+an attachment to an existing interactive session or the Claude desktop app.
+The intended public aliases are:
+
+- `cd-opus-5-5-medium`: Opus 5.5, medium effort.
+- `cd-fable-5-1-medium`: Fable 5.1, medium effort.
+- `cd-fable-high`: Fable 5.1, high effort.
+- `cd-fable-5-medium`: Fable 5, medium effort.
+
+Availability depends on an installed, authenticated Claude Code CLI and the
+models available to that account. A running Claude desktop app does not prove
+CLI availability or authentication. Do not extract desktop credentials to
+make this transport work.
+
+Set `CLAUDE_CODE_BIN` to the real CLI executable when it is not on PATH.
+For a native Windows CLI invoked from WSL, use its `/mnt/c/.../claude.exe`
+path, not the desktop app executable. An explicitly selected profile uses
+`CODEX_SHIM_CLAUDE_CONFIG_DIR`; the CLI remains responsible for authentication
+and refresh. Verify the selected CLI's login before enabling it in the daemon.
+Interactive sessions must never be resumed or reused by API requests.
+
+The initial adapter supports Chat Completions and Responses with explicit
+text history only. Anthropic Messages, Responses compaction, images,
+structured-output formats, implicit prior-response history, and client tools
+are unsupported. It disables local tools and session persistence, and rejects
+client tool requests instead of silently executing commands on the shim host
+or claiming transparent tool compatibility. No Claude Jev IO profiles are added.
+
+`CODEX_SHIM_DISABLE_CLAUDE=1` disables discovery and routing. To correct model
+IDs for your account, set `CODEX_SHIM_CLAUDE_MODEL_OVERRIDES` to a JSON object
+mapping public aliases to verified upstream IDs. Effort stays fixed by alias.
+For a Windows executable, `CODEX_SHIM_CLAUDE_CONFIG_DIR` must be a native
+Windows path. Authentication is probed with `auth status --json`; aliases are
+advertised only after a subscription login is detected. This probe does not
+verify model entitlement. Requests have a 180-second timeout. The isolated
+working directory and disabled tools are not an OS sandbox.
+Model identifiers must be checked against the installed CLI/account before
+advertising a deployment as verified.
+
+### UltraCode scope
+
+[claude-shim](https://github.com/petr-korobeinikov/claude-shim) provides useful
+profile-selection patterns using `CLAUDE_CONFIG_DIR`; it is not an inference
+server. [UltraCode-Shim](https://github.com/OnlyTerp/UltraCode-Shim) routes and
+translates requests while Claude Code supplies the workflow tool and agent
+loop. Adding `cd-*` aliases does not add that workflow runtime to an OpenAI
+client. UltraCode compatibility remains a separate milestone requiring
+structured tool round-trip tests and explicit worker-routing support; it is
+not enabled by this text-only transport.
 
 ---
 

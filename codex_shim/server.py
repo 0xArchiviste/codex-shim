@@ -14,6 +14,11 @@ from urllib.parse import urljoin
 
 from aiohttp import ClientSession, ClientTimeout, web
 
+from contextlib import aclosing
+from .claude_passthrough import (
+    build_claude_prompt, claude_passthrough_available, claude_passthrough_display_names,
+    is_claude_passthrough_slug, iter_claude_agent_events,
+)
 from .cursor_passthrough import (
     CURSOR_MODEL_SLUG,
     build_cursor_prompt,
@@ -245,6 +250,9 @@ class ShimServer:
                         "active": current == slug,
                     }
                 )
+        if claude_passthrough_available():
+            data.extend({"slug": slug, "display_name": name, "provider": "claude-code", "active": current == slug}
+                        for slug, name in claude_passthrough_display_names().items())
         for m in usable_byok_models(self.settings.load()):
             data.append(
                 {
@@ -304,6 +312,9 @@ class ShimServer:
         if cursor_passthrough_available():
             valid.update(cursor_passthrough_display_names())
             display_for.update(cursor_passthrough_display_names())
+        if claude_passthrough_available():
+            valid.update(claude_passthrough_display_names())
+            display_for.update(claude_passthrough_display_names())
         # Normalize nickname → canonical slug before writing config.
         for mix in self._active_ensemble_mixes():
             if slug == mix.nickname:
@@ -324,6 +335,9 @@ class ShimServer:
         passthrough_count = len(chatgpt_passthrough_slugs()) if chatgpt_ok else 0
         if cursor_ok:
             passthrough_count += len(cursor_passthrough_display_names())
+        claude_ok = claude_passthrough_available()
+        if claude_ok:
+            passthrough_count += len(claude_passthrough_display_names())
         count = len(models) + passthrough_count
         ensemble_mixes = self._active_ensemble_mixes()
         count += len(ensemble_mixes)
@@ -335,6 +349,7 @@ class ShimServer:
                 "models": count,
                 "chatgpt_passthrough": chatgpt_ok,
                 "cursor_passthrough": cursor_ok,
+                "claude_passthrough": claude_ok,
                 "auto_router": self._active_router() is not None,
                 "ensemble": len(ensemble_mixes) > 0,
                 "ensemble_mixes": [m.slug for m in ensemble_mixes],
@@ -365,6 +380,9 @@ class ShimServer:
                 }
                 for slug in sorted(cursor_passthrough_display_names())
             )
+        if claude_passthrough_available():
+            data.extend({"id": slug, "object": "model", "created": now, "owned_by": "claude-code"}
+                        for slug in claude_passthrough_display_names())
         data.extend({"id": model.slug, "object": "model", "created": now, "owned_by": "codex-shim"} for model in usable_byok_models(self.settings.load()))
         for mix in self._active_ensemble_mixes():
             data.append(ensemble_module.models_entry(mix, now))
@@ -394,6 +412,12 @@ class ShimServer:
                 upstream_model=upstream,
                 as_chat=True,
             )
+        if is_claude_passthrough_slug(model):
+            try:
+                build_claude_prompt(body)  # validate original tool history before translation
+            except ValueError as exc:
+                return web.json_response({"error": {"type": "invalid_request_error", "message": str(exc)}}, status=400)
+            return await self._claude_passthrough(request, chat_to_responses_request(body, model), model, as_chat=True)
         if is_cursor_passthrough_slug(model):
             forwarded = chat_to_responses_request(body, cursor_upstream_model(model))
             return await self._cursor_passthrough(
@@ -431,6 +455,8 @@ class ShimServer:
                 upstream_model=upstream,
                 as_anthropic=True,
             )
+        if is_claude_passthrough_slug(model):
+            return web.json_response({"error": {"type": "invalid_request_error", "message": "Claude Code bridge supports /v1/responses and /v1/chat/completions only"}}, status=400)
         if is_cursor_passthrough_slug(model):
             upstream = cursor_upstream_model(model)
             chat_body = anthropic_messages_to_chat(body, upstream, body.get("max_tokens"))
@@ -474,6 +500,8 @@ class ShimServer:
                 response_model_override=override,
                 upstream_model=upstream,
             )
+        if is_claude_passthrough_slug(model):
+            return await self._claude_passthrough(request, body, model)
         if is_cursor_passthrough_slug(model):
             return await self._cursor_passthrough(
                 request,
@@ -497,6 +525,8 @@ class ShimServer:
         _log_incoming_request("/v1/responses/compact", body)
         body = await self._maybe_apply_auto_router(body)
         model = str(body.get("model") or "")
+        if is_claude_passthrough_slug(model):
+            return web.json_response({"error": {"type": "invalid_request_error", "message": "Claude Code bridge does not support Responses compaction"}}, status=400)
         io_profile = io_profiles_module.find_profile(self._active_io_config(), model)
         if io_profile is not None:
             compact_body = dict(body)
@@ -833,6 +863,64 @@ class ShimServer:
             payload = await upstream.json(content_type=None)
         _rewrite_response_model(payload, original_model or None)
         return web.json_response(payload)
+
+    async def _claude_passthrough(self, request, body, slug, *, as_chat=False):
+        try:
+            prompt = build_claude_prompt(body)
+        except ValueError as exc:
+            return web.json_response({"error": {"type": "invalid_request_error", "code": "unsupported_claude_request", "message": str(exc)}}, status=400)
+        if not claude_passthrough_available():
+            return web.json_response({"error": {"type": "authentication_error", "code": "claude_unavailable", "message": "Claude Code subscription login unavailable; configure CLAUDE_CODE_BIN and run Claude login."}}, status=401)
+        stream = bool(body.get("stream"))
+        response = _sse_response() if stream else None
+        state = ResponsesToChatStreamState(slug) if as_chat else ResponsesStreamState(slug, {})
+        if stream:
+            await response.prepare(request)
+            if not as_chat:
+                await state.start(response)
+        text, usage = "", None
+        try:
+            async with aclosing(iter_claude_agent_events(prompt, slug)) as events:
+                async for event in events:
+                    kind = event["type"]
+                    if kind == "error":
+                        error = {"type": "upstream_error", "code": event.get("code"), "message": event["message"]}
+                        if not stream:
+                            return web.json_response({"error": error}, status=502)
+                        await _write_sse(response, {"type": "error", "error": error})
+                        await response.write_eof()
+                        return response
+                    if kind == "text_delta":
+                        text += event["delta"]
+                        if stream:
+                            if as_chat:
+                                for chunk in state.text_delta(event["delta"]):
+                                    await _write_sse(response, chunk)
+                            else:
+                                await state.write_chat_delta(response, {"choices": [{"delta": {"content": event["delta"]}}]})
+                    elif kind == "usage":
+                        usage = normalize_responses_usage(event.get("usage"))
+                    elif kind == "completed":
+                        text = event.get("text", text)
+        except ClientDisconnected:
+            return response
+        if stream:
+            if usage:
+                state.usage = usage
+            if as_chat:
+                for chunk in state.finish():
+                    await _write_sse(response, chunk)
+                await _safe_write(response, b"data: [DONE]\n\n")
+            else:
+                await state.finish(response)
+            await response.write_eof()
+            return response
+        payload = {"id": f"resp_{uuid.uuid4().hex}", "object": "response", "model": slug,
+                   "status": "completed", "output": [{"id": "msg_0", "type": "message", "role": "assistant",
+                   "status": "completed", "content": [{"type": "output_text", "text": text, "annotations": []}]}]}
+        if usage:
+            payload["usage"] = usage
+        return web.json_response(response_to_chat_completion(payload, slug) if as_chat else payload)
 
     async def _cursor_passthrough(
         self,

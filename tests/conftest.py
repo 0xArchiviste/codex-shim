@@ -6,6 +6,7 @@ import pytest
 @pytest.fixture(autouse=True)
 def _isolate_shim_runtime_env(monkeypatch, tmp_path_factory):
     """Keep local tunnel/auth env from leaking into unit tests."""
+    monkeypatch.setenv("CODEX_SHIM_DISABLE_CLAUDE", "1")
     monkeypatch.delenv("CODEX_SHIM_API_KEY", raising=False)
     monkeypatch.delenv("CODEX_SHIM_ALLOWED_HOSTS", raising=False)
     key_path = tmp_path_factory.mktemp("shim-api") / "api-key"

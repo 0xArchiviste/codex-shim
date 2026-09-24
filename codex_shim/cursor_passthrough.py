@@ -28,6 +28,7 @@ CURSOR_MODEL_ALIASES: dict[str, tuple[str, str]] = {
     "cx-fable-5": ("claude-fable-5-medium", "Cursor Fable 5 Medium"),
     "cx-fable-5-high": ("claude-fable-5-high", "Cursor Fable 5 High"),
     "cx-opus-5": ("claude-opus-5-thinking-high", "Cursor Opus 5 High Thinking"),
+    "cx-opus-5-5": ("claude-opus-5-5-medium", "Cursor Opus 5.5"),
     "cx-sol-5-6": ("gpt-5.6-sol-medium", "Cursor GPT-5.6 Sol Medium"),
     "cx-sol-5-6-high": ("gpt-5.6-sol-high", "Cursor GPT-5.6 Sol High"),
 }

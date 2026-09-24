@@ -23,6 +23,10 @@ from . import ensemble as ensemble_module
 from . import router as router_module
 from . import io_profiles as io_profiles_module
 from .catalog import _toml_escape, codex_config_overrides, write_catalog, write_config
+from .claude_passthrough import (
+    claude_passthrough_available, claude_passthrough_display_names,
+    claude_upstream_model, is_claude_passthrough_slug,
+)
 from .cursor_passthrough import (
     cursor_passthrough_available,
     cursor_passthrough_display_names,
@@ -241,6 +245,9 @@ def doctor(settings_path: Path, port: int) -> int:
     checks.extend(_doctor_daemon(port))
     checks.extend(_doctor_chatgpt())
     checks.extend(_doctor_cursor())
+    checks.append(DoctorCheck("Claude Code passthrough", "OK" if claude_passthrough_available() else "INFO",
+                              "subscription login available (model access unverified)" if claude_passthrough_available()
+                              else "unavailable or disabled; configure CLAUDE_CODE_BIN and Claude login"))
     checks.extend(_doctor_proxy_env())
     checks.extend(_doctor_codex_config())
     _print_doctor_report(checks)
@@ -397,7 +404,7 @@ def _doctor_daemon(port: int) -> list[DoctorCheck]:
         checks.append(DoctorCheck("Shim daemon", "OK", f"health ok: {model_count} models"))
     else:
         checks.append(DoctorCheck("Shim daemon", "WARN", f"health not ok: {model_count} models"))
-    for key in ("chatgpt_passthrough", "cursor_passthrough", "auto_router"):
+    for key in ("chatgpt_passthrough", "cursor_passthrough", "claude_passthrough", "auto_router"):
         if key in health:
             checks.append(DoctorCheck("Shim daemon", "INFO", f"{key}: {_bool_text(health.get(key))}"))
     return checks
@@ -625,6 +632,9 @@ def list_models(settings_path: Path) -> int:
     if cursor_passthrough_available():
         for slug, display_name in cursor_passthrough_display_names().items():
             rows.append((slug, display_name, "composer-2.5", "cursor-subscription"))
+    if claude_passthrough_available():
+        for slug, display_name in claude_passthrough_display_names().items():
+            rows.append((slug, display_name, claude_upstream_model(slug), "claude-code"))
     rows.extend((model.slug, model.display_name, model.model, model.provider) for model in usable_byok_models(models))
     for mix in _active_ensemble_mixes(models, settings_path):
         rows.append(
@@ -1128,6 +1138,8 @@ def _provider_display_name(models, slug: str, router_config=None) -> str:
         display_name = cursor_passthrough_display_names().get(slug)
         if display_name:
             return display_name
+    if claude_passthrough_available() and slug in claude_passthrough_display_names():
+        return claude_passthrough_display_names()[slug]
     for model in models:
         if model.slug == slug:
             return model.display_name
@@ -1360,6 +1372,10 @@ def _resolve_model_slug(models, requested: str | None, router_config=None) -> st
         if requested.startswith("openai-gpt-"):
             return CHATGPT_MODEL_SLUG
         return requested
+    if is_claude_passthrough_slug(requested):
+        if not claude_passthrough_available():
+            raise SystemExit("Claude Code subscription login unavailable. Configure CLAUDE_CODE_BIN and run Claude login.")
+        return requested
     if is_cursor_passthrough_slug(requested):
         if not cursor_passthrough_available():
             raise SystemExit(
@@ -1420,6 +1436,8 @@ def _valid_model_slugs(models, router_config=None) -> set[str]:
         slugs.update(chatgpt_passthrough_slugs())
     if cursor_passthrough_available():
         slugs.update(cursor_passthrough_display_names())
+    if claude_passthrough_available():
+        slugs.update(claude_passthrough_display_names())
     return slugs
 
 
