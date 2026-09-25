@@ -61,6 +61,23 @@ It sends the Codex access token as `Authorization: Bearer ...` and, when
 present, the account id from `auth.json`. The token is not written into the
 custom model catalog.
 
+### Login failover
+
+Set `CODEX_SHIM_CHATGPT_AUTH_FALLBACKS` to extra `auth.json` paths, separated by
+`os.pathsep` (`:` on Linux/WSL). They are tried after `~/.codex/auth.json`:
+
+```bash
+CODEX_SHIM_CHATGPT_AUTH_FALLBACKS=/mnt/c/Users/<you>/.codex/auth.json
+```
+
+- A `401` mentioning `invalid_api_key` / `sk-svcac` is an intermittent backend
+  fault. It is retried once on the same login, then the next login is tried.
+- Any other `401` moves straight to the next login and puts the failing one
+  last for five minutes.
+- Unexpired logins go first, starting with the last one that worked.
+- The shim never refreshes or writes these files. Refresh tokens rotate, so a
+  second refresher would log out the owning Codex app.
+
 ### Setup
 
 ```bash
@@ -99,6 +116,9 @@ to stop listing ChatGPT passthrough entries immediately.
   picker behavior.
 - If `/health` reports `chatgpt_passthrough: false`, the daemon process may have
   been started before login or with `CODEX_SHIM_DISABLE_CHATGPT` set.
+- `[chatgpt] 401 (transient|hard) with login <path>` log lines show which login
+  was rejected and whether failover was used. A newer `codex login` on another
+  OS (e.g. Windows) does not update `~/.codex/auth.json`; add it as a fallback.
 
 ---
 

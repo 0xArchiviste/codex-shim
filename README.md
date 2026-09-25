@@ -575,6 +575,16 @@ model to `gpt-5.5`, and sends your Codex access token as `Authorization: Bearer
 <access_token>` with the ChatGPT account id from `auth.json` when present. It
 bypasses configured BYOK routes entirely and uses your ChatGPT subscription quota.
 
+The Codex backend sometimes rejects a valid login with `401 invalid_api_key`
+naming its own internal `sk-svcac…` key. The shim retries that once on the same
+login, then fails over to the logins listed in
+`CODEX_SHIM_CHATGPT_AUTH_FALLBACKS` (`os.pathsep`-separated `auth.json` paths,
+e.g. the Windows Codex app's `/mnt/c/Users/<you>/.codex/auth.json` under WSL).
+Expired logins are tried last, the last login that worked is tried first, and a
+login that gets a different 401 is tried last for five minutes. The shim only
+reads these files; it never refreshes or writes them, so it cannot log out the
+app that owns them.
+
 They are included in `.codex-shim/custom_model_catalog.json` after
 `codex-shim generate`. Opaque aliases avoid collisions with consuming clients'
 built-in model registries. Current GPT-6 medium aliases include:

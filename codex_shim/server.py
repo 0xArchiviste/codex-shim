@@ -30,6 +30,7 @@ from .cursor_passthrough import (
     iter_cursor_agent_events,
 )
 from . import telemetry
+from . import chatgpt_auth
 from .usage_ui import usage_html
 from . import ensemble as ensemble_module
 from . import router as router_module
@@ -786,16 +787,9 @@ class ShimServer:
         or ``as_anthropic`` is set, translates the Responses reply back into
         that client wire format so Codex models can be used as a BYOK provider.
         """
-        auth_path = DEFAULT_CODEX_AUTH.expanduser()
-        try:
-            auth = json.loads(auth_path.read_text())
-        except FileNotFoundError:
-            raise web.HTTPUnauthorized(text="~/.codex/auth.json not found")
-        tokens = auth.get("tokens") or {}
-        access_token = tokens.get("access_token")
-        account_id = tokens.get("account_id") or ""
-        if not access_token:
-            raise web.HTTPUnauthorized(text="auth.json has no access_token")
+        credentials = chatgpt_auth.load_credentials(DEFAULT_CODEX_AUTH)
+        if not credentials:
+            raise web.HTTPUnauthorized(text="no usable Codex login (~/.codex/auth.json)")
         tool_aliases = chatgpt_tool_name_aliases(body.get("tools"))
         forwarded = _sanitize_chatgpt_passthrough_body(body)
         forwarded["model"] = upstream_model or CHATGPT_MODEL_SLUG
@@ -806,17 +800,15 @@ class ShimServer:
         _log_chatgpt_forward(forwarded)
         client_model = response_model_override or forwarded["model"]
         headers = {
-            "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
             "OpenAI-Beta": "responses=2026-02-06",
             "originator": "codex_cli_rs",
-            "chatgpt-account-id": account_id,
             "session_id": request.headers.get("session_id", ""),
         }
         url = "https://chatgpt.com/backend-api/codex/responses"
         async with ClientSession(timeout=self.timeout) as session:
-            upstream = await session.post(url, json=forwarded, headers=headers)
+            upstream = await chatgpt_auth.post_with_failover(session.post, credentials, url, forwarded, headers)
             if upstream.status >= 400:
                 return await _error_response(upstream, slug="chatgpt")
             if not client_wants_stream:
@@ -867,32 +859,23 @@ class ShimServer:
         body: dict[str, Any],
         upstream_model: str | None = None,
     ) -> web.StreamResponse:
-        auth_path = DEFAULT_CODEX_AUTH.expanduser()
-        try:
-            auth = json.loads(auth_path.read_text())
-        except FileNotFoundError:
-            raise web.HTTPUnauthorized(text="~/.codex/auth.json not found")
-        tokens = auth.get("tokens") or {}
-        access_token = tokens.get("access_token")
-        account_id = tokens.get("account_id") or ""
-        if not access_token:
-            raise web.HTTPUnauthorized(text="auth.json has no access_token")
+        credentials = chatgpt_auth.load_credentials(DEFAULT_CODEX_AUTH)
+        if not credentials:
+            raise web.HTTPUnauthorized(text="no usable Codex login (~/.codex/auth.json)")
         forwarded = _sanitize_chatgpt_passthrough_body(body)
         original_model = str(forwarded.get("model") or "")
         forwarded["model"] = upstream_model or CHATGPT_MODEL_SLUG
         forwarded.pop("stream", None)
         headers = {
-            "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
             "OpenAI-Beta": "responses=2026-02-06",
             "originator": "codex_cli_rs",
-            "chatgpt-account-id": account_id,
             "session_id": request.headers.get("session_id", ""),
         }
         url = "https://chatgpt.com/backend-api/codex/responses/compact"
         async with ClientSession(timeout=self.timeout) as session:
-            upstream = await session.post(url, json=forwarded, headers=headers)
+            upstream = await chatgpt_auth.post_with_failover(session.post, credentials, url, forwarded, headers)
             if upstream.status >= 400:
                 return await _error_response(upstream)
             payload = await upstream.json(content_type=None)
@@ -1482,13 +1465,9 @@ class ShimServer:
     async def _ensemble_chatgpt_json(
         self, forwarded: dict[str, Any], slug: str, upstream_model: str
     ) -> dict[str, Any]:
-        auth_path = DEFAULT_CODEX_AUTH.expanduser()
-        auth = json.loads(auth_path.read_text())
-        tokens = auth.get("tokens") or {}
-        access_token = tokens.get("access_token")
-        if not access_token:
+        credentials = chatgpt_auth.load_credentials(DEFAULT_CODEX_AUTH)
+        if not credentials:
             raise RuntimeError("ChatGPT auth missing access_token")
-        account_id = tokens.get("account_id") or ""
         body = _sanitize_chatgpt_passthrough_body(dict(forwarded))
         body["model"] = upstream_model
         body["store"] = False
@@ -1496,17 +1475,15 @@ class ShimServer:
         body.pop("tools", None)
         body.pop("tool_choice", None)
         headers = {
-            "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
             "OpenAI-Beta": "responses=2026-02-06",
             "originator": "codex_cli_rs",
-            "chatgpt-account-id": account_id,
         }
         url = "https://chatgpt.com/backend-api/codex/responses"
         timeout = ClientTimeout(total=180, sock_connect=30, sock_read=180)
         async with ClientSession(timeout=timeout) as session:
-            upstream = await session.post(url, json=body, headers=headers)
+            upstream = await chatgpt_auth.post_with_failover(session.post, credentials, url, body, headers)
             if upstream.status >= 400:
                 err = await upstream.text()
                 raise RuntimeError(f"{slug} HTTP {upstream.status}: {err[:300]}")
@@ -1773,23 +1750,22 @@ class ShimServer:
             return await upstream.json(content_type=None)
 
     async def _io_chatgpt_json(self, body: dict[str, Any], upstream_model: str) -> dict[str, Any]:
-        auth = json.loads(DEFAULT_CODEX_AUTH.expanduser().read_text())
-        tokens = auth.get("tokens") or {}
-        access_token = tokens.get("access_token")
-        if not access_token:
+        credentials = chatgpt_auth.load_credentials(DEFAULT_CODEX_AUTH)
+        if not credentials:
             raise RuntimeError("ChatGPT auth missing access_token")
         forwarded = _sanitize_chatgpt_passthrough_body(dict(body))
         forwarded["model"] = upstream_model
         forwarded["store"] = False
         forwarded["stream"] = True
         headers = {
-            "Authorization": f"Bearer {access_token}", "Content-Type": "application/json",
-            "Accept": "text/event-stream", "OpenAI-Beta": "responses=2026-02-06",
-            "originator": "codex_cli_rs", "chatgpt-account-id": tokens.get("account_id") or "",
+            "Content-Type": "application/json", "Accept": "text/event-stream",
+            "OpenAI-Beta": "responses=2026-02-06", "originator": "codex_cli_rs",
         }
         timeout = ClientTimeout(total=180, sock_connect=30, sock_read=180)
         async with ClientSession(timeout=timeout) as session:
-            upstream = await session.post("https://chatgpt.com/backend-api/codex/responses", json=forwarded, headers=headers)
+            upstream = await chatgpt_auth.post_with_failover(
+                session.post, credentials, "https://chatgpt.com/backend-api/codex/responses", forwarded, headers
+            )
             if upstream.status >= 400:
                 raise RuntimeError(f"ChatGPT HTTP {upstream.status}: {(await upstream.text())[:400]}")
             return await _collect_completed_response(upstream)

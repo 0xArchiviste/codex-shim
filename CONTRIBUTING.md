@@ -71,6 +71,18 @@ running deployment instead of assuming it.
 - UltraCode workflow support requires separate tool protocol validation; adding
   model aliases alone does not provide Claude Code's orchestration runtime.
 
+## ChatGPT passthrough auth
+
+- Every chatgpt.com call goes through `codex_shim/chatgpt_auth.py`
+  (`load_credentials` + `post_with_failover`). Do not read `auth.json` or
+  build the `Authorization` header by hand in new call sites.
+- The shim only reads saved Codex logins. Never refresh, rewrite, copy, or
+  symlink `auth.json`; refresh tokens rotate, and a second refresher logs
+  out the owning app.
+- A `401` with `invalid_api_key` / `sk-svcac` is a backend flake: retry once,
+  then fail over. Other statuses are returned as-is, with no failover.
+- Logs may name the login path and attempt, never token contents.
+
 ## What kinds of changes are useful
 
 - Translation fixes for tricky tool-call / reasoning streams, with a
