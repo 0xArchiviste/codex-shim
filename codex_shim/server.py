@@ -448,7 +448,10 @@ class ShimServer:
                 build_claude_prompt(body)  # validate original tool history before translation
             except ValueError as exc:
                 return web.json_response({"error": {"type": "invalid_request_error", "message": str(exc)}}, status=400)
-            return await self._claude_passthrough(request, chat_to_responses_request(body, model), model, as_chat=True)
+            # build_claude_prompt already accepts Chat Completions input. Converting
+            # tool history to Responses first duplicates large tool outputs and can
+            # turn a valid conversation into an upstream-invalid prompt.
+            return await self._claude_passthrough(request, body, model, as_chat=True)
         if is_cursor_passthrough_slug(model):
             forwarded = chat_to_responses_request(body, cursor_upstream_model(model))
             return await self._cursor_passthrough(

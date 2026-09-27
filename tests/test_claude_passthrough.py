@@ -290,6 +290,40 @@ async def test_routing(monkeypatch, tmp_path, endpoint, field, stream):
         assert health["claude_passthrough"] is True
 
 
+async def test_chat_route_keeps_original_tool_history_for_claude(monkeypatch, tmp_path):
+    """Chat -> Responses conversion must not balloon tool results in the CLI prompt."""
+    from codex_shim import server
+
+    monkeypatch.setattr(server, "claude_passthrough_available", lambda: True)
+    seen = []
+
+    async def events(prompt, slug):
+        seen.append((prompt, slug))
+        yield {"type": "completed", "text": "OK"}
+
+    monkeypatch.setattr(server, "iter_claude_agent_events", events)
+    settings = tmp_path / "settings.json"
+    settings.write_text('{"models":[]}')
+    shim = server.ShimServer(settings)
+    body = {
+        "model": "cd-opus-5-5-medium", "stream": False,
+        "tools": [{"type": "function", "function": {"name": "Read", "parameters": {"type": "object"}}}],
+        "messages": [
+            {"role": "user", "content": "read the file"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "Read", "arguments": '{"path":"a"}'}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "file contents"},
+            {"role": "user", "content": "reply OK"},
+        ],
+    }
+    async with TestClient(TestServer(shim.app())) as client:
+        response = await client.post("/v1/chat/completions", json=body)
+        assert response.status == 200
+        assert (await response.json())["choices"][0]["message"]["content"] == "OK"
+    assert len(seen) == 1 and seen[0][1] == body["model"]
+    assert seen[0][0] == claude.build_claude_prompt(body)
+    assert "file contents" in seen[0][0] and "call_1" in seen[0][0]
+
+
 @pytest.mark.parametrize("exception,code", [(FileNotFoundError(), "claude_process_error"), (TimeoutError(), "claude_timeout")])
 async def test_spawn_failure(monkeypatch, exception, code):
     async def spawn(*a, **kw):

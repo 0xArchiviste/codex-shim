@@ -135,7 +135,10 @@ def build_claude_prompt(body: dict[str, Any]) -> str:
                 validate(child)
     validate(body.get("input"))
     validate(body.get("messages"))
-    chat = responses_to_chat(body, str(body.get("model") or ""))
+    # Chat Completions already carries the conversation and tool results in
+    # messages. Round-tripping through Responses needlessly inflates tool
+    # history and can cause upstream prompt rejection.
+    chat = body if "messages" in body else responses_to_chat(body, str(body.get("model") or ""))
     sections = []
     tools = body.get("tools") or []
     if tools:
